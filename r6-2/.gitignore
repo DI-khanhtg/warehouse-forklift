@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.test_tmp*/
+.audit_test_tmp/
+.venv/
+
+# Runtime-generated outputs and downloaded weights
+output/*
+!output/.gitkeep
+input/*
+!input/.gitkeep
+*.pt

@@ -1,0 +1,92 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Packaging and build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Environment variables and local secrets
+.env
+.env.*
+!.env.example
+
+# Datasets and generated data
+data/
+datasets/
+*.cache
+*.npy
+*.npz
+*.parquet
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+
+# ML model weights and experiment artifacts
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.engine
+*.tflite
+**/weights/*
+!**/weights/.gitkeep
+runs/
+wandb/
+mlruns/
+
+# Large archives
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+
+# Input/output media and generated results
+**/input/*
+!**/input/.gitkeep
+**/output/*
+!**/output/.gitkeep
+outputs/
+results/
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+~$*
+
+# Jupyter
+.ipynb_checkpoints/
+.notebook-runtime/
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini
