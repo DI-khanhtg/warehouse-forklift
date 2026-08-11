@@ -58,7 +58,7 @@ PROGRESS_INTERVAL = 100
 MAX_FRAMES: int | None = None
 OVERWRITE_OUTPUT = True
 SHOW_PREVIEW = False
-DEBUG_OVERLAY = False
+DEBUG_OVERLAY = True
 ENABLE_CAMERA_COMPENSATION = True
 FALLBACK_FPS = 30.0
 
@@ -66,7 +66,7 @@ FALLBACK_FPS = 30.0
 # DETECTOR / TRACKER -- TUNED FOR WEAK DETECTIONS AND TEMPORARY OCCLUSION
 # =============================================================================
 
-FORKLIFT_CONF_THRESHOLD = 0.10
+FORKLIFT_CONF_THRESHOLD = 0.15
 IMAGE_SIZE = 1920
 
 # YOLO26 is end-to-end/NMS-free, so a legacy detector IOU_THRESHOLD is not a
@@ -88,8 +88,8 @@ SEGMENTATION_IMAGE_SIZE = 640
 
 # Keep symmetric padding modest, but extend farther above the detector box: the
 # detector can cover only the forklift body while the mast continues upward.
-CROP_PADDING = 0.15
-CROP_TOP_PADDING = 0.75
+CROP_PADDING = 0.50
+CROP_TOP_PADDING = 1.75
 
 # Conservative background-camera compensation.  Only a well-supported affine
 # transform is accepted; otherwise the trajectory history is re-warmed.

@@ -3,5 +3,5 @@
 torch==2.13.0+cu130
 torchvision==0.28.0+cu130
 ultralytics==8.4.116
-opencv-python==5.0.0.93
+opencv-python==4.14.0.94
 lap>=0.5.12
