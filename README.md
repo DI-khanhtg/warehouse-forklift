@@ -1,15 +1,14 @@
 # warehouse-forklift
 
-The repository uses one shared `uv` environment at `.venv/` for `r2`, `r6-2`,
-and `r7`.
 
 ```powershell
-# Create/update the shared environment from the repository root
 uv sync
 
 # Run tools without manually activating the environment
-uv run python r7/test-tracking/scripts/r7_demo.py --help
-uv run pytest r6-2/tests
+uv run --frozen python r7/test-tracking/scripts/r7_demo.py
+uv run --frozen python r2/test-tracking/scripts/r2_demo.py
+uv run --frozen python r2/test-tracking/scripts/track_forklift.py
+uv run --frozen python r6-2/infer_camera.py
 
 # Optional activation for an IDE terminal
 .\.venv\Scripts\Activate.ps1

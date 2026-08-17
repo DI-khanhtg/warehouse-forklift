@@ -27,6 +27,9 @@ from typing import Any, Iterable, Mapping, Sequence
 import cv2
 import numpy as np
 from ultralytics import YOLO
+from ultralytics.trackers.byte_tracker import BYTETracker
+from ultralytics.utils import IterableSimpleNamespace, YAML
+from ultralytics.utils.checks import check_yaml
 from ultralytics.utils.torch_utils import select_device
 
 
@@ -58,26 +61,43 @@ PROGRESS_INTERVAL = 100
 MAX_FRAMES: int | None = None
 OVERWRITE_OUTPUT = True
 SHOW_PREVIEW = False
-DEBUG_OVERLAY = True
+DEBUG_OVERLAY = False
 ENABLE_CAMERA_COMPENSATION = True
 FALLBACK_FPS = 30.0
 
 # =============================================================================
-# DETECTOR / TRACKER -- TUNED FOR WEAK DETECTIONS AND TEMPORARY OCCLUSION
+# DETECTOR / TRACKER -- TUNED FOR PARTIAL BOXES AND TEMPORARY OCCLUSION
 # =============================================================================
 
-FORKLIFT_CONF_THRESHOLD = 0.15
+# The detector produces useful low-confidence body/mast/fork fragments.  This
+# threshold must not sit above TRACK_LOW_THRESHOLD or ByteTrack never sees its
+# recovery band.
+FORKLIFT_CONF_THRESHOLD = 0.01
 IMAGE_SIZE = 1920
 
 # YOLO26 is end-to-end/NMS-free, so a legacy detector IOU_THRESHOLD is not a
-# meaningful tuning control here. ByteTrack association uses MATCH_THRESHOLD.
-TRACK_LOW_THRESHOLD = 0.05
-TRACK_HIGH_THRESHOLD = 0.12
-NEW_TRACK_THRESHOLD = 0.12
-TRACK_BUFFER_SECONDS = 2.0
-MATCH_THRESHOLD = 0.80
-FUSE_SCORE = True
-TRACK_STATE_TTL_SECONDS = 2.0
+# meaningful tuning control here.  Its duplicate/partial predictions are fused
+# into physical forklift proposals before ByteTrack association.
+TRACK_LOW_THRESHOLD = 0.01
+TRACK_HIGH_THRESHOLD = 0.03
+NEW_TRACK_THRESHOLD = 0.25
+TRACK_BUFFER_SECONDS = 3.0
+MATCH_THRESHOLD = 0.85
+# Score fusion makes a 0.10-confidence detection impossible to match at a 0.80
+# cost limit even with perfect IoU.  Geometry-only association is intentional
+# for this weak-score detector.
+FUSE_SCORE = False
+TRACK_STATE_TTL_SECONDS = 3.2
+PREDICTED_TRACK_SECONDS = 1.50
+
+# The detector often emits separate boxes for the forklift body, mast, and fork.
+# Merge compatible fragments rather than letting the tracker assign one ID to
+# every part.  A relative confidence floor prevents tiny false-positive boxes
+# from stretching a good proposal across the frame.
+FUSION_RELATIVE_CONFIDENCE = 0.15
+FUSION_MIN_INTERSECTION_OVER_SMALLER = 0.16
+FUSION_MIN_ALIGNED_OVERLAP = 0.42
+FUSION_MAX_ALIGNED_GAP = 0.28
 
 # =============================================================================
 # CROP / SEGMENTATION
@@ -149,6 +169,7 @@ NORMAL_COLOR = (70, 220, 90)
 CAUTION_COLOR = (0, 180, 255)
 ALERT_COLOR = (20, 20, 240)
 UNKNOWN_COLOR = (165, 165, 165)
+PREDICTED_COLOR = (230, 150, 40)
 
 UNKNOWN = "UNKNOWN"
 STATIC = "STATIC"
@@ -156,6 +177,23 @@ RAISING = "RAISING"
 LOWERING = "LOWERING"
 FORWARD = "FORWARD"
 REVERSE = "REVERSE"
+
+BEHAVIOR_UNKNOWN = "UNKNOWN"
+BEHAVIOR_IDLE = "IDLE"
+BEHAVIOR_NORMAL_TRAVEL = "NORMAL TRAVEL"
+BEHAVIOR_SAFE_FORK_OPERATION = "SAFE: FORK OPERATING WHILE STOPPED"
+BEHAVIOR_CAUTION_FORK_MOVING = "CAUTION: FORK OPERATING WHILE MOVING"
+BEHAVIOR_R7_REVERSE_LOWERING = "R7 VIOLATION: REVERSE + LOWERING"
+BEHAVIOR_R7_TURN_LOWERING = "R7 VIOLATION: TURN + LOWERING"
+BEHAVIOR_R7_REVERSE_TURN_LOWERING = (
+    "R7 VIOLATION: REVERSE + TURN + LOWERING"
+)
+
+BEHAVIOR_LEVEL_UNKNOWN = "UNKNOWN"
+BEHAVIOR_LEVEL_NORMAL = "NORMAL"
+BEHAVIOR_LEVEL_SAFE = "SAFE"
+BEHAVIOR_LEVEL_CAUTION = "CAUTION"
+BEHAVIOR_LEVEL_R7 = "R7"
 
 
 @dataclass(frozen=True)
@@ -197,6 +235,45 @@ class TrackedDetection:
     track_id: int
     bbox: tuple[float, float, float, float]
     confidence: float
+    observed: bool = True
+    frames_since_observation: int = 0
+
+
+@dataclass(frozen=True)
+class DetectionProposal:
+    """One physical-forklift proposal after fusing detector fragments."""
+
+    bbox: tuple[float, float, float, float]
+    confidence: float
+    component_count: int = 1
+
+
+@dataclass(frozen=True)
+class DetectionBatch:
+    """Minimal NumPy Results-like container consumed by Ultralytics ByteTrack."""
+
+    xyxy: np.ndarray
+    conf: np.ndarray
+    cls: np.ndarray
+
+    def __len__(self) -> int:
+        return int(len(self.conf))
+
+    def __getitem__(self, index: Any) -> "DetectionBatch":
+        return DetectionBatch(
+            np.asarray(self.xyxy[index], dtype=np.float32).reshape(-1, 4),
+            np.asarray(self.conf[index], dtype=np.float32).reshape(-1),
+            np.asarray(self.cls[index], dtype=np.float32).reshape(-1),
+        )
+
+    @property
+    def xywh(self) -> np.ndarray:
+        output = np.asarray(self.xyxy, dtype=np.float32).copy()
+        if not len(output):
+            return output.reshape(0, 4)
+        output[:, 2:] -= output[:, :2]
+        output[:, :2] += output[:, 2:] / 2.0
+        return output
 
 
 @dataclass(frozen=True)
@@ -323,11 +400,122 @@ class TrackState:
         self.turn_latch.invalidate()
 
 
+class OutputBoxStabilizer:
+    """Smooth display/analysis boxes without feeding lag back into ByteTrack."""
+
+    def __init__(self, ttl_frames: int) -> None:
+        self.ttl_frames = max(1, ttl_frames)
+        self.boxes: dict[int, tuple[np.ndarray, int]] = {}
+
+    def update(
+        self,
+        detections: list[TrackedDetection],
+        frame_index: int,
+        frame_shape: tuple[int, ...],
+    ) -> list[TrackedDetection]:
+        output: list[TrackedDetection] = []
+        for detection in detections:
+            current = np.asarray(detection.bbox, dtype=np.float64)
+            previous_record = self.boxes.get(detection.track_id)
+            if previous_record is not None:
+                previous, previous_frame = previous_record
+                if frame_index - previous_frame <= self.ttl_frames:
+                    previous_center = (previous[:2] + previous[2:]) / 2.0
+                    current_center = (current[:2] + current[2:]) / 2.0
+                    previous_size = previous[2:] - previous[:2]
+                    current_size = current[2:] - current[:2]
+
+                    center_alpha = 0.72 if detection.observed else 0.88
+                    center = previous_center + center_alpha * (
+                        current_center - previous_center
+                    )
+                    # Grow quickly when another forklift component becomes
+                    # visible, but shrink slowly when a detector frame contains
+                    # only the body or only the mast.
+                    growth_target = np.minimum(current_size, 1.35 * previous_size)
+                    size_alpha = np.where(
+                        growth_target >= previous_size,
+                        0.78,
+                        0.12 if detection.observed else 0.35,
+                    )
+                    size = previous_size + size_alpha * (
+                        growth_target - previous_size
+                    )
+                    current = np.concatenate((center - size / 2.0, center + size / 2.0))
+
+            bbox = clipped_bbox(current, frame_shape)
+            if bbox is None:
+                continue
+            stabilized = np.asarray(bbox, dtype=np.float64)
+            self.boxes[detection.track_id] = (stabilized, frame_index)
+            output.append(
+                TrackedDetection(
+                    detection.track_id,
+                    bbox,
+                    detection.confidence,
+                    detection.observed,
+                    detection.frames_since_observation,
+                )
+            )
+
+        stale_ids = [
+            track_id
+            for track_id, (_, last_frame) in self.boxes.items()
+            if frame_index - last_frame > self.ttl_frames
+        ]
+        for track_id in stale_ids:
+            del self.boxes[track_id]
+        return output
+
+
+def classify_behavior(state: TrackState) -> tuple[str, str]:
+    """Interpret the confirmed technical state without creating new evidence."""
+
+    reverse_violation = state.reverse_latch.active
+    turn_violation = state.turn_latch.active
+
+    if reverse_violation and turn_violation:
+        return BEHAVIOR_R7_REVERSE_TURN_LOWERING, BEHAVIOR_LEVEL_R7
+    if reverse_violation:
+        return BEHAVIOR_R7_REVERSE_LOWERING, BEHAVIOR_LEVEL_R7
+    if turn_violation:
+        return BEHAVIOR_R7_TURN_LOWERING, BEHAVIOR_LEVEL_R7
+
+    fork_state = state.current_fork_state
+    is_moving = state.current_is_moving
+    if fork_state == UNKNOWN or is_moving is None:
+        return BEHAVIOR_UNKNOWN, BEHAVIOR_LEVEL_UNKNOWN
+    if fork_state in (RAISING, LOWERING):
+        if is_moving is False:
+            return BEHAVIOR_SAFE_FORK_OPERATION, BEHAVIOR_LEVEL_SAFE
+        if is_moving is True:
+            return BEHAVIOR_CAUTION_FORK_MOVING, BEHAVIOR_LEVEL_CAUTION
+    if fork_state == STATIC:
+        if is_moving is True:
+            return BEHAVIOR_NORMAL_TRAVEL, BEHAVIOR_LEVEL_NORMAL
+        if is_moving is False:
+            return BEHAVIOR_IDLE, BEHAVIOR_LEVEL_NORMAL
+    return BEHAVIOR_UNKNOWN, BEHAVIOR_LEVEL_UNKNOWN
+
+
+def fork_operation_state(fork_state: str) -> str:
+    """Map the fork motion estimate to a compact operator-facing state."""
+
+    if fork_state in (RAISING, LOWERING):
+        return "ACTIVE"
+    if fork_state == STATIC:
+        return "INACTIVE"
+    return UNKNOWN
+
+
 @dataclass
 class RunStats:
     frames_processed: int = 0
     tracked_rows: int = 0
     frames_with_tracks: int = 0
+    raw_detections: int = 0
+    fused_proposals: int = 0
+    predicted_track_rows: int = 0
     segmentation_crops: int = 0
     fork_hits: int = 0
     mast_hits: int = 0
@@ -483,7 +671,10 @@ CSV_FIELDS = [
     "frame",
     "timestamp_sec",
     "track_id",
+    "tracking_source",
+    "frames_since_observation",
     "fork_state",
+    "fork_operation",
     "fork_relative_height",
     "fork_slope",
     "is_moving",
@@ -494,6 +685,8 @@ CSV_FIELDS = [
     "reverse_lowering",
     "turn_lowering",
     "r7_violation",
+    "behavior_level",
+    "behavior",
     "forklift_confidence",
     "fork_confidence",
     "mast_confidence",
@@ -710,6 +903,19 @@ def resolve_tracker(value: str) -> str:
     raise FileNotFoundError(f"Tracker config not found: {candidate.resolve()}")
 
 
+def create_fused_tracker(config: str) -> BYTETracker:
+    """Create ByteTrack explicitly so detector fragments can be fused first."""
+
+    config_path = check_yaml(config)
+    tracker_args = IterableSimpleNamespace(**YAML.load(config_path))
+    if tracker_args.tracker_type != "bytetrack":
+        raise ValueError(
+            "Fused forklift tracking currently requires tracker_type=bytetrack; "
+            f"got {tracker_args.tracker_type!r} from {config_path}"
+        )
+    return BYTETracker(args=tracker_args)
+
+
 def validate_model(model: YOLO, expected_task: str, path: Path) -> None:
     actual = str(getattr(model, "task", "")).casefold()
     if actual != expected_task:
@@ -767,30 +973,28 @@ def frame_count_for(seconds: float, fps: float) -> int:
     return max(1, int(math.ceil(seconds * fps)))
 
 
-def extract_tracked_detections(
+def extract_detection_proposals(
     result: Any, forklift_class_id: int
-) -> list[TrackedDetection]:
+) -> list[DetectionProposal]:
+    """Extract finite detector boxes before physical-object fusion."""
+
     boxes = getattr(result, "boxes", None)
-    if boxes is None or len(boxes) == 0 or getattr(boxes, "id", None) is None:
+    if boxes is None or len(boxes) == 0:
         return []
 
     xyxy = boxes.xyxy.detach().cpu().numpy()
-    track_ids = boxes.id.detach().cpu().numpy()
     confidences = boxes.conf.detach().cpu().numpy()
     classes = boxes.cls.detach().cpu().numpy()
-    count = min(len(xyxy), len(track_ids), len(confidences), len(classes))
+    count = min(len(xyxy), len(confidences), len(classes))
 
-    by_track: dict[int, TrackedDetection] = {}
+    proposals: list[DetectionProposal] = []
     for index in range(count):
         raw_values = np.asarray(xyxy[index], dtype=np.float64)
         if raw_values.shape != (4,) or not np.isfinite(raw_values).all():
             continue
-        track_value = float(track_ids[index])
         class_value = float(classes[index])
         confidence = float(confidences[index])
-        if not all(
-            math.isfinite(value) for value in (track_value, class_value, confidence)
-        ):
+        if not all(math.isfinite(value) for value in (class_value, confidence)):
             continue
         class_id = int(round(class_value))
         if class_id != forklift_class_id:
@@ -798,39 +1002,301 @@ def extract_tracked_detections(
         x1, y1, x2, y2 = map(float, raw_values)
         if x2 <= x1 or y2 <= y1:
             continue
-        track_id = int(round(track_value))
-        detection = TrackedDetection(track_id, (x1, y1, x2, y2), confidence)
-        previous = by_track.get(track_id)
-        if previous is None or detection.confidence > previous.confidence:
-            by_track[track_id] = detection
-    return [by_track[track_id] for track_id in sorted(by_track)]
+        proposals.append(DetectionProposal((x1, y1, x2, y2), confidence))
+    return proposals
 
 
-def extract_all_forklift_boxes(
-    result: Any, forklift_class_id: int
-) -> list[tuple[float, float, float, float]]:
-    """Return tracked and untracked forklift boxes for background exclusion."""
+def box_intersection_metrics(
+    first: tuple[float, float, float, float],
+    second: tuple[float, float, float, float],
+) -> tuple[float, float, float, float, float]:
+    """Return intersection-over-smaller plus aligned overlap and gap ratios."""
 
-    boxes = getattr(result, "boxes", None)
-    if boxes is None or len(boxes) == 0:
-        return []
-    xyxy = boxes.xyxy.detach().cpu().numpy()
-    classes = boxes.cls.detach().cpu().numpy()
-    output: list[tuple[float, float, float, float]] = []
-    for raw_box, raw_class in zip(xyxy, classes):
-        values = np.asarray(raw_box, dtype=np.float64)
-        class_value = float(raw_class)
+    ax1, ay1, ax2, ay2 = first
+    bx1, by1, bx2, by2 = second
+    aw, ah = max(0.0, ax2 - ax1), max(0.0, ay2 - ay1)
+    bw, bh = max(0.0, bx2 - bx1), max(0.0, by2 - by1)
+    overlap_x = max(0.0, min(ax2, bx2) - max(ax1, bx1))
+    overlap_y = max(0.0, min(ay2, by2) - max(ay1, by1))
+    intersection = overlap_x * overlap_y
+    smaller_area = max(1.0, min(aw * ah, bw * bh))
+    x_overlap = overlap_x / max(1.0, min(aw, bw))
+    y_overlap = overlap_y / max(1.0, min(ah, bh))
+    horizontal_gap = max(0.0, max(ax1, bx1) - min(ax2, bx2))
+    vertical_gap = max(0.0, max(ay1, by1) - min(ay2, by2))
+    return (
+        intersection / smaller_area,
+        x_overlap,
+        y_overlap,
+        horizontal_gap / max(1.0, min(aw, bw)),
+        vertical_gap / max(1.0, min(ah, bh)),
+    )
+
+
+def fragments_are_compatible(
+    first: DetectionProposal, second: DetectionProposal
+) -> bool:
+    """Decide whether two boxes are likely parts of the same forklift."""
+
+    io_smaller, x_overlap, y_overlap, horizontal_gap, vertical_gap = (
+        box_intersection_metrics(first.bbox, second.bbox)
+    )
+    if io_smaller >= FUSION_MIN_INTERSECTION_OVER_SMALLER:
+        return True
+    vertically_aligned = (
+        x_overlap >= FUSION_MIN_ALIGNED_OVERLAP
+        and vertical_gap <= FUSION_MAX_ALIGNED_GAP
+    )
+    horizontally_aligned = (
+        y_overlap >= FUSION_MIN_ALIGNED_OVERLAP
+        and horizontal_gap <= FUSION_MAX_ALIGNED_GAP
+    )
+    return vertically_aligned or horizontally_aligned
+
+
+def fuse_detection_proposals(
+    raw_proposals: list[DetectionProposal],
+) -> list[DetectionProposal]:
+    """Fuse body/mast/fork fragments while resisting low-score box bridges."""
+
+    remaining = set(range(len(raw_proposals)))
+    order = sorted(
+        remaining,
+        key=lambda index: raw_proposals[index].confidence,
+        reverse=True,
+    )
+    fused: list[DetectionProposal] = []
+    for anchor_index in order:
+        if anchor_index not in remaining:
+            continue
+        anchor = raw_proposals[anchor_index]
+        confidence_floor = max(
+            TRACK_LOW_THRESHOLD,
+            FUSION_RELATIVE_CONFIDENCE * anchor.confidence,
+        )
+        member_indices = [anchor_index]
+        for candidate_index in order:
+            if candidate_index == anchor_index or candidate_index not in remaining:
+                continue
+            candidate = raw_proposals[candidate_index]
+            if candidate.confidence < confidence_floor:
+                continue
+            if fragments_are_compatible(anchor, candidate):
+                member_indices.append(candidate_index)
+
+        members = [raw_proposals[index] for index in member_indices]
+        remaining.difference_update(member_indices)
+        x1 = min(item.bbox[0] for item in members)
+        y1 = min(item.bbox[1] for item in members)
+        x2 = max(item.bbox[2] for item in members)
+        y2 = max(item.bbox[3] for item in members)
+        fused.append(
+            DetectionProposal(
+                (x1, y1, x2, y2),
+                max(item.confidence for item in members),
+                len(members),
+            )
+        )
+    return fused
+
+
+def detection_batch(
+    proposals: list[DetectionProposal], forklift_class_id: int
+) -> DetectionBatch:
+    if not proposals:
+        return DetectionBatch(
+            np.empty((0, 4), dtype=np.float32),
+            np.empty((0,), dtype=np.float32),
+            np.empty((0,), dtype=np.float32),
+        )
+    return DetectionBatch(
+        np.asarray([item.bbox for item in proposals], dtype=np.float32),
+        np.asarray([item.confidence for item in proposals], dtype=np.float32),
+        np.full((len(proposals),), forklift_class_id, dtype=np.float32),
+    )
+
+
+def clipped_bbox(
+    bbox: Sequence[float], frame_shape: tuple[int, ...]
+) -> tuple[float, float, float, float] | None:
+    values = np.asarray(bbox, dtype=np.float64)
+    if values.shape != (4,) or not np.isfinite(values).all():
+        return None
+    frame_height, frame_width = frame_shape[:2]
+    x1 = max(0.0, min(float(frame_width - 1), float(values[0])))
+    y1 = max(0.0, min(float(frame_height - 1), float(values[1])))
+    x2 = max(0.0, min(float(frame_width - 1), float(values[2])))
+    y2 = max(0.0, min(float(frame_height - 1), float(values[3])))
+    if x2 - x1 <= 2.0 or y2 - y1 <= 2.0:
+        return None
+    return x1, y1, x2, y2
+
+
+def track_fragments_are_compatible(
+    first: TrackedDetection, second: TrackedDetection
+) -> bool:
+    """Use a slightly wider gate when one fragment is a Kalman prediction."""
+
+    first_proposal = DetectionProposal(first.bbox, first.confidence)
+    second_proposal = DetectionProposal(second.bbox, second.confidence)
+    if fragments_are_compatible(first_proposal, second_proposal):
+        return True
+    if (
+        first.observed
+        and second.observed
+        and min(first.confidence, second.confidence) >= NEW_TRACK_THRESHOLD
+    ):
+        # Two independent, high-confidence observations should not be merged by
+        # the wider prediction/weak-fragment proximity gate.
+        return False
+
+    ax1, ay1, ax2, ay2 = first.bbox
+    bx1, by1, bx2, by2 = second.bbox
+    first_center = np.asarray(((ax1 + ax2) / 2.0, (ay1 + ay2) / 2.0))
+    second_center = np.asarray(((bx1 + bx2) / 2.0, (by1 + by2) / 2.0))
+    normalizer = max(
+        1.0,
+        math.hypot(ax2 - ax1, ay2 - ay1),
+        math.hypot(bx2 - bx1, by2 - by1),
+    )
+    center_distance = float(np.linalg.norm(first_center - second_center)) / normalizer
+    _, x_overlap, y_overlap, _, _ = box_intersection_metrics(
+        first.bbox, second.bbox
+    )
+    return center_distance <= 1.05 and max(x_overlap, y_overlap) >= 0.05
+
+
+def consolidate_tracked_detections(
+    detections: list[TrackedDetection], track_lifetimes: Mapping[int, int]
+) -> list[TrackedDetection]:
+    """Collapse part-level ByteTrack tracks into stable physical-forklift IDs."""
+
+    remaining = set(range(len(detections)))
+    consolidated: list[TrackedDetection] = []
+    while remaining:
+        seed = min(remaining)
+        component = {seed}
+        frontier = [seed]
+        remaining.remove(seed)
+        while frontier:
+            current = frontier.pop()
+            compatible = [
+                index
+                for index in remaining
+                if track_fragments_are_compatible(
+                    detections[current], detections[index]
+                )
+            ]
+            for index in compatible:
+                remaining.remove(index)
+                component.add(index)
+                frontier.append(index)
+
+        members = [detections[index] for index in component]
+        canonical = max(
+            members,
+            key=lambda item: (
+                int(track_lifetimes.get(item.track_id, 0)),
+                item.observed,
+                item.confidence,
+                -item.track_id,
+            ),
+        )
+        observed = [item for item in members if item.observed]
+        if observed:
+            best_confidence = max(item.confidence for item in observed)
+            confidence_floor = max(
+                TRACK_LOW_THRESHOLD,
+                FUSION_RELATIVE_CONFIDENCE * best_confidence,
+            )
+            reliable = [
+                item for item in observed if item.confidence >= confidence_floor
+            ]
+            x1 = min(item.bbox[0] for item in reliable)
+            y1 = min(item.bbox[1] for item in reliable)
+            x2 = max(item.bbox[2] for item in reliable)
+            y2 = max(item.bbox[3] for item in reliable)
+            consolidated.append(
+                TrackedDetection(
+                    canonical.track_id,
+                    (x1, y1, x2, y2),
+                    best_confidence,
+                    True,
+                    0,
+                )
+            )
+        else:
+            consolidated.append(
+                TrackedDetection(
+                    canonical.track_id,
+                    canonical.bbox,
+                    canonical.confidence,
+                    False,
+                    min(item.frames_since_observation for item in members),
+                )
+            )
+    return sorted(consolidated, key=lambda item: item.track_id)
+
+
+def update_fused_tracker(
+    tracker: BYTETracker,
+    proposals: list[DetectionProposal],
+    forklift_class_id: int,
+    frame: np.ndarray,
+    prediction_frames: int,
+) -> list[TrackedDetection]:
+    """Update ByteTrack and expose short Kalman predictions for visual continuity."""
+
+    tracked_rows = tracker.update(
+        detection_batch(proposals, forklift_class_id),
+        img=frame,
+    )
+    detections: list[TrackedDetection] = []
+    active_ids: set[int] = set()
+    for raw_row in tracked_rows:
+        row = np.asarray(raw_row, dtype=np.float64)
+        if row.size < 8 or not np.isfinite(row[:6]).all():
+            continue
+        bbox = clipped_bbox(row[:4], frame.shape)
+        if bbox is None:
+            continue
+        track_id = int(round(float(row[4])))
+        active_ids.add(track_id)
+        detections.append(
+            TrackedDetection(track_id, bbox, float(row[5]), True, 0)
+        )
+
+    # Ultralytics deliberately omits lost tracks from its result.  The internal
+    # Kalman filter still predicts them, so draw a bounded, clearly marked box
+    # during short detector dropouts without treating it as rule evidence.
+    for track in tracker.lost_stracks:
+        track_id = int(track.track_id)
+        age = int(tracker.frame_id - track.frame_id)
         if (
-            values.shape != (4,)
-            or not np.isfinite(values).all()
-            or not math.isfinite(class_value)
-            or int(round(class_value)) != forklift_class_id
+            track_id in active_ids
+            or not track.is_activated
+            or age < 1
+            or age > prediction_frames
         ):
             continue
-        x1, y1, x2, y2 = map(float, values)
-        if x2 > x1 and y2 > y1:
-            output.append((x1, y1, x2, y2))
-    return output
+        bbox = clipped_bbox(track.xyxy, frame.shape)
+        if bbox is None:
+            continue
+        decay = max(0.05, 1.0 - age / max(1.0, prediction_frames + 1.0))
+        detections.append(
+            TrackedDetection(
+                track_id,
+                bbox,
+                float(track.score) * decay,
+                False,
+                age,
+            )
+        )
+    track_lifetimes = {
+        int(track.track_id): int(tracker.frame_id - track.start_frame + 1)
+        for track in (*tracker.tracked_stracks, *tracker.lost_stracks)
+    }
+    return consolidate_tracked_detections(detections, track_lifetimes)
 
 
 def append_motion_sample(
@@ -1584,6 +2050,8 @@ def csv_row(
     timestamp: float,
     detection: TrackedDetection,
     state: TrackState,
+    behavior_label: str,
+    behavior_level: str,
     fork: MaskObservation | None,
     mast: MaskObservation | None,
     reverse_lowering: bool,
@@ -1600,7 +2068,10 @@ def csv_row(
         "frame": frame_index,
         "timestamp_sec": f"{timestamp:.3f}",
         "track_id": detection.track_id,
+        "tracking_source": "DETECTED" if detection.observed else "PREDICTED",
+        "frames_since_observation": detection.frames_since_observation,
         "fork_state": state.current_fork_state,
+        "fork_operation": fork_operation_state(state.current_fork_state),
         "fork_relative_height": format_optional(state.fork_relative_height, 6)
         if state.fork_relative_height is not None
         else "",
@@ -1619,6 +2090,8 @@ def csv_row(
         "reverse_lowering": int(reverse_lowering),
         "turn_lowering": int(turn_lowering),
         "r7_violation": ";".join(active_rules) if active_rules else "NONE",
+        "behavior_level": behavior_level,
+        "behavior": behavior_label,
         "forklift_confidence": f"{detection.confidence:.5f}",
         "fork_confidence": f"{fork.confidence:.5f}" if fork is not None else "",
         "mast_confidence": f"{mast.confidence:.5f}" if mast is not None else "",
@@ -1645,6 +2118,7 @@ def print_progress(
     print(
         f"[progress] {stats.frames_processed}/{total_text} frames | "
         f"{processing_fps:.2f} FPS | tracks rows={stats.tracked_rows} | "
+        f"raw/fused={stats.raw_detections}/{stats.fused_proposals} | "
         f"R7 frames={stats.violation_frames}",
         flush=True,
     )
@@ -1728,7 +2202,7 @@ def process_video(args: argparse.Namespace) -> RunStats:
         )
         if default_tracker_requested:
             write_default_tracker_config(TRACKER_CONFIG_PATH, fps)
-        tracker = resolve_tracker(tracker_arg)
+        tracker_config = resolve_tracker(tracker_arg)
         resolved_device = resolve_device(str(args.device))
         if used_fallback_fps:
             print(
@@ -1741,7 +2215,7 @@ def process_video(args: argparse.Namespace) -> RunStats:
         print(f"Events CSV: {events_path}")
         print(f"Detector:   {detector_path}")
         print(f"Segmenter:  {segmenter_path}")
-        print(f"Tracker:    {tracker}")
+        print(f"Tracker:    {tracker_config} (fragment fusion + ByteTrack)")
         print(
             f"Video:      {frame_width}x{frame_height} @ {fps:.3f} FPS, "
             f"frames={total_frames if total_frames is not None else 'unknown'}"
@@ -1763,9 +2237,9 @@ def process_video(args: argparse.Namespace) -> RunStats:
                 else "compensation DISABLED (use only for a known fixed camera)"
             )
         )
-        if default_tracker_requested and args.forklift_conf >= TRACK_HIGH_THRESHOLD:
+        if default_tracker_requested and args.forklift_conf > TRACK_LOW_THRESHOLD:
             print(
-                f"[warning] --forklift-conf >= {TRACK_HIGH_THRESHOLD} disables "
+                f"[warning] --forklift-conf > {TRACK_LOW_THRESHOLD} truncates "
                 "the bundled ByteTrack low-score recovery band.",
                 file=sys.stderr,
             )
@@ -1799,7 +2273,10 @@ def process_video(args: argparse.Namespace) -> RunStats:
 
         states: dict[int, TrackState] = {}
         camera_estimator = GlobalMotionEstimator()
+        fused_tracker = create_fused_tracker(tracker_config)
         max_missing_frames = frame_count_for(TRACK_STATE_TTL_SECONDS, fps)
+        box_stabilizer = OutputBoxStabilizer(max_missing_frames)
+        prediction_frames = frame_count_for(PREDICTED_TRACK_SECONDS, fps)
         release_frames = frame_count_for(R7_RELEASE_SECONDS, fps)
         confirm_frames = frame_count_for(R7_CONFIRM_SECONDS, fps)
         call_kwargs = model_call_kwargs(resolved_device)
@@ -1808,27 +2285,47 @@ def process_video(args: argparse.Namespace) -> RunStats:
 
         while True:
             timestamp = frame_index / fps
-            track_results = detector.track(
+            detector_results = detector.predict(
                 frame,
-                persist=True,
-                tracker=tracker,
                 classes=[forklift_class_id],
                 conf=args.forklift_conf,
                 imgsz=IMAGE_SIZE,
                 verbose=False,
                 **call_kwargs,
             )
-            track_result = track_results[0] if track_results else None
-            detections = (
-                extract_tracked_detections(track_result, forklift_class_id)
-                if track_result is not None
+            detector_result = detector_results[0] if detector_results else None
+            raw_proposals = (
+                extract_detection_proposals(detector_result, forklift_class_id)
+                if detector_result is not None
                 else []
             )
-            all_forklift_boxes = (
-                extract_all_forklift_boxes(track_result, forklift_class_id)
-                if track_result is not None
-                else []
+            fused_proposals = fuse_detection_proposals(raw_proposals)
+            detections = update_fused_tracker(
+                fused_tracker,
+                fused_proposals,
+                forklift_class_id,
+                frame,
+                prediction_frames,
             )
+            # Never introduce a brand-new visible object from a Kalman-only
+            # fragment.  Predictions are continuity for an already displayed
+            # physical track, not evidence that a new forklift exists.
+            detections = [
+                detection
+                for detection in detections
+                if detection.observed or detection.track_id in states
+            ]
+            detections = box_stabilizer.update(
+                detections,
+                frame_index,
+                frame.shape,
+            )
+            stats.raw_detections += len(raw_proposals)
+            stats.fused_proposals += len(fused_proposals)
+            stats.predicted_track_rows += sum(
+                not detection.observed for detection in detections
+            )
+            all_forklift_boxes = [proposal.bbox for proposal in fused_proposals]
             if args.disable_camera_compensation:
                 camera_motion = CameraMotionEstimate(True, None)
             else:
@@ -1846,12 +2343,14 @@ def process_video(args: argparse.Namespace) -> RunStats:
                         )
             if camera_motion.valid and not args.disable_camera_compensation:
                 stats.camera_motion_valid_frames += 1
-            current_track_ids = {detection.track_id for detection in detections}
+            observed_track_ids = {
+                detection.track_id for detection in detections if detection.observed
+            }
 
             # Any gap breaks a candidate immediately.  Active alerts get only the
             # short configured release grace, never new candidate credit.
             for track_id, state in list(states.items()):
-                if track_id not in current_track_ids:
+                if track_id not in observed_track_ids:
                     state.mark_missing(release_frames)
                 if frame_index - state.last_seen_frame > max_missing_frames:
                     del states[track_id]
@@ -1860,6 +2359,10 @@ def process_video(args: argparse.Namespace) -> RunStats:
                 tuple[TrackedDetection, tuple[int, int, int, int], np.ndarray]
             ] = []
             for detection in detections:
+                # A Kalman-only row keeps the visual ID continuous but never
+                # advances segmentation, motion, direction, or alert evidence.
+                if not detection.observed:
+                    continue
                 crop_box = padded_crop_box(
                     detection.bbox,
                     frame.shape,
@@ -2020,24 +2523,20 @@ def process_video(args: argparse.Namespace) -> RunStats:
                 if state.reverse_latch.active or state.turn_latch.active:
                     frame_violation_track_ids.add(detection.track_id)
 
+                behavior_label, behavior_level = classify_behavior(state)
+                fork_operation = fork_operation_state(state.current_fork_state)
+
                 blend_mask(frame, mast, crop_box, MAST_COLOR)
                 blend_mask(frame, fork, crop_box, FORK_COLOR)
 
-                has_violation = state.reverse_latch.active or state.turn_latch.active
-                bbox_color = (
-                    ALERT_COLOR
-                    if has_violation
-                    else UNKNOWN_COLOR
-                    if (
-                        state.current_fork_state == UNKNOWN
-                        or state.current_direction == UNKNOWN
-                        or state.current_is_turning is None
-                    )
-                    else CAUTION_COLOR
-                    if state.current_direction == REVERSE
-                    or state.current_is_turning is True
-                    else NORMAL_COLOR
-                )
+                if behavior_level == BEHAVIOR_LEVEL_R7:
+                    bbox_color = ALERT_COLOR
+                elif behavior_level == BEHAVIOR_LEVEL_CAUTION:
+                    bbox_color = CAUTION_COLOR
+                elif behavior_level in (BEHAVIOR_LEVEL_SAFE, BEHAVIOR_LEVEL_NORMAL):
+                    bbox_color = NORMAL_COLOR
+                else:
+                    bbox_color = UNKNOWN_COLOR
                 draw_x1 = max(0, min(frame_width - 1, int(round(x1))))
                 draw_y1 = max(0, min(frame_height - 1, int(round(y1))))
                 draw_x2 = max(0, min(frame_width - 1, int(round(x2))))
@@ -2047,7 +2546,7 @@ def process_video(args: argparse.Namespace) -> RunStats:
                 )
                 lines = [
                     f"ID {detection.track_id} forklift {detection.confidence:.2f}",
-                    f"Fork: {state.current_fork_state}",
+                    "Track: DETECTED",
                     "Motion: "
                     + (
                         "MOVING"
@@ -2056,8 +2555,11 @@ def process_video(args: argparse.Namespace) -> RunStats:
                         if state.current_is_moving is False
                         else UNKNOWN
                     ),
+                    f"Fork operation: {fork_operation}",
+                    f"Fork state: {state.current_fork_state}",
                     f"Direction: {state.current_direction}",
                     f"Turning: {tri_state(state.current_is_turning)}",
+                    f"Behavior: {behavior_label}",
                 ]
                 if args.debug:
                     lines.extend(
@@ -2073,13 +2575,6 @@ def process_video(args: argparse.Namespace) -> RunStats:
                             f"mast={format_optional(mast.confidence if mast else None, 2)}",
                         ]
                     )
-                if has_violation:
-                    active_names: list[str] = []
-                    if state.reverse_latch.active:
-                        active_names.append("REVERSE + LOWERING")
-                    if state.turn_latch.active:
-                        active_names.append("TURN + LOWERING")
-                    lines.append("R7 VIOLATION: " + " | ".join(active_names))
                 draw_label_lines(frame, lines, (draw_x1, draw_y1), bbox_color)
 
                 csv_writer.writerow(
@@ -2088,6 +2583,8 @@ def process_video(args: argparse.Namespace) -> RunStats:
                         timestamp,
                         detection,
                         state,
+                        behavior_label,
+                        behavior_level,
                         fork,
                         mast,
                         reverse_lowering,
@@ -2098,15 +2595,34 @@ def process_video(args: argparse.Namespace) -> RunStats:
                 )
                 stats.tracked_rows += 1
 
-            # A valid tracked box with an invalid crop still gets its own state
-            # invalidated; no stale rule evidence is reused.
+            # A Kalman prediction or a valid tracked box with an invalid crop
+            # gets a visible row, but never reuses stale rule evidence.
             for detection in detections:
                 if detection.track_id not in processed_detection_ids:
                     state = states.setdefault(
                         detection.track_id, TrackState(detection.track_id)
                     )
-                    state.last_seen_frame = frame_index
+                    if detection.observed:
+                        state.last_seen_frame = frame_index
                     state.mark_missing(release_frames)
+                    behavior_label, behavior_level = classify_behavior(state)
+                    fork_operation = fork_operation_state(state.current_fork_state)
+                    tracking_text = (
+                        "DETECTED (invalid crop)"
+                        if detection.observed
+                        else (
+                            "PREDICTED "
+                            f"(+{detection.frames_since_observation} frames)"
+                        )
+                    )
+                    suppression_text = (
+                        "Invalid crop; state suppressed"
+                        if detection.observed
+                        else "Detector gap; state suppressed"
+                    )
+                    track_color = (
+                        UNKNOWN_COLOR if detection.observed else PREDICTED_COLOR
+                    )
                     raw_x1, raw_y1, raw_x2, raw_y2 = detection.bbox
                     invalid_x1 = max(0, min(frame_width - 1, int(round(raw_x1))))
                     invalid_y1 = max(0, min(frame_height - 1, int(round(raw_y1))))
@@ -2116,21 +2632,24 @@ def process_video(args: argparse.Namespace) -> RunStats:
                         frame,
                         (invalid_x1, invalid_y1),
                         (invalid_x2, invalid_y2),
-                        UNKNOWN_COLOR,
+                        track_color,
                         2,
                     )
                     draw_label_lines(
                         frame,
                         [
                             f"ID {detection.track_id} forklift {detection.confidence:.2f}",
-                            "Fork: UNKNOWN",
+                            f"Track: {tracking_text}",
                             "Motion: UNKNOWN",
+                            f"Fork operation: {fork_operation}",
+                            "Fork state: UNKNOWN",
                             "Direction: UNKNOWN",
                             "Turning: UNKNOWN",
-                            "Invalid crop; state suppressed",
+                            f"Behavior: {behavior_label}",
+                            suppression_text,
                         ],
                         (invalid_x1, invalid_y1),
-                        UNKNOWN_COLOR,
+                        track_color,
                     )
                     csv_writer.writerow(
                         csv_row(
@@ -2138,6 +2657,8 @@ def process_video(args: argparse.Namespace) -> RunStats:
                             timestamp,
                             detection,
                             state,
+                            behavior_label,
+                            behavior_level,
                             None,
                             None,
                             False,
@@ -2218,6 +2739,11 @@ def process_video(args: argparse.Namespace) -> RunStats:
         print(f"  Frames processed:       {stats.frames_processed}")
         print(f"  Average processing FPS: {stats.frames_processed / elapsed:.2f}")
         print(f"  Track rows:             {stats.tracked_rows}")
+        print(
+            "  Detector boxes fused:   "
+            f"{stats.raw_detections} -> {stats.fused_proposals} proposals"
+        )
+        print(f"  Predicted track rows:   {stats.predicted_track_rows}")
         print(f"  Segmentation crops:     {stats.segmentation_crops}")
         print(f"  Fork/mast paired hits:  {stats.paired_hits}")
         if not args.disable_camera_compensation:
