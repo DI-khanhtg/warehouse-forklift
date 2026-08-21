@@ -1,4 +1,4 @@
-"""R7 forklift demo: tracking, fork/mast segmentation, and temporal alerts.
+"""R7 demo: forklift/fork/person tracking and operator-aware temporal alerts.
 
 The script intentionally returns UNKNOWN whenever the current evidence is
 missing or ambiguous.  It never carries a stale fork/direction estimate into a
@@ -45,11 +45,11 @@ OUTPUT_DIR = PROJECT_ROOT / "outputs"
 
 FORKLIFT_MODEL_PATH = MODEL_DIR / "best_fresh.pt"
 R7_SEGMENTATION_MODEL_PATH = MODEL_DIR / "r7_yolo26s_seg_forks_mast_best.pt"
+PERSON_MODEL_PATH = MODEL_DIR / "yolo26s.pt"
 VIDEO_PATH = VIDEO_DIR / "test3.mp4"
 TRACKER_CONFIG_PATH = CONFIG_DIR / "r7_bytetrack.yaml"
 OUTPUT_VIDEO_PATH = OUTPUT_DIR / "test3_r7.mp4"
 OUTPUT_CSV_PATH = OUTPUT_DIR / "test3_r7_events.csv"
-
 # =============================================================================
 # RUN DEFAULTS
 # =============================================================================
@@ -74,6 +74,17 @@ FALLBACK_FPS = 30.0
 # recovery band.
 FORKLIFT_CONF_THRESHOLD = 0.01
 IMAGE_SIZE = 1920
+
+# Person inference is full-frame and has its own detector/tracker namespace.
+# Keep these controls separate from the weak-score forklift fragment pipeline.
+PERSON_CONF_THRESHOLD = 0.20
+PERSON_IMAGE_SIZE = 1280
+PERSON_DETECT_EVERY_N_FRAMES = 1
+PERSON_ROI_EXPAND_X = 0.35
+PERSON_ROI_EXPAND_TOP = 0.70
+PERSON_ROI_EXPAND_BOTTOM = 0.35
+PERSON_ROI_DEDUP_IOU = 0.70
+PERSON_ROI_DEDUP_INTERSECTION_OVER_SMALLER = 0.90
 
 # YOLO26 is end-to-end/NMS-free, so a legacy detector IOU_THRESHOLD is not a
 # meaningful tuning control here.  Its duplicate/partial predictions are fused
@@ -141,6 +152,7 @@ TURN_RELEASE_SECONDS = 0.15
 # forklift bbox height.  Therefore the regression slope unit is bbox-height/s.
 FORK_WINDOW_SECONDS = 0.70
 FORK_MAX_GAP_SECONDS = 0.25
+FORK_GAP_TOLERANCE_SECONDS = 0.40
 MIN_FORK_SAMPLES = 8
 MIN_FORK_SPAN_SECONDS = 0.40
 MIN_FORK_DYNAMIC_CHANGE = 0.015  # bbox heights over the fitted time span
@@ -163,6 +175,26 @@ DIRECTION_REQUIRED_RATIO = 0.70
 R7_CONFIRM_SECONDS = 0.50
 R7_RELEASE_SECONDS = 0.22
 
+# Driver association combines spatial, motion, and temporal evidence.  A person
+# miss is UNKNOWN, never evidence that the forklift has no driver.
+DRIVER_ASSOC_ENTER_SCORE = 0.65
+DRIVER_ASSOC_EXIT_SCORE = 0.40
+DRIVER_ASSOC_CONFIRM_SECONDS = 0.40
+DRIVER_ASSOC_RELEASE_SECONDS = 1.00
+DRIVER_MIN_PERSON_OVERLAP = 0.15
+DRIVER_ROI_EXPAND_X = 0.10
+DRIVER_ROI_EXPAND_Y = 0.10
+DRIVER_ROI_WEIGHT = 0.40
+DRIVER_FORKLIFT_OVERLAP_WEIGHT = 0.20
+DRIVER_MOTION_WEIGHT = 0.25
+DRIVER_TEMPORAL_WEIGHT = 0.15
+DRIVER_CENTER_RELATION_FLOOR = 0.35
+DRIVER_MOTION_DIRECTION_WEIGHT = 0.45
+DRIVER_MOTION_DISPLACEMENT_WEIGHT = 0.25
+DRIVER_MOTION_RELATIVE_WEIGHT = 0.30
+DRIVER_MOTION_MIN_SAMPLES = 3
+DRIVER_MOTION_MIN_SPAN_SECONDS = 0.15
+
 FORK_COLOR = (255, 60, 210)  # BGR, magenta
 MAST_COLOR = (40, 220, 255)  # BGR, yellow/cyan
 NORMAL_COLOR = (70, 220, 90)
@@ -170,6 +202,8 @@ CAUTION_COLOR = (0, 180, 255)
 ALERT_COLOR = (20, 20, 240)
 UNKNOWN_COLOR = (165, 165, 165)
 PREDICTED_COLOR = (230, 150, 40)
+PERSON_COLOR = (220, 190, 60)
+DRIVER_COLOR = (180, 80, 255)
 
 UNKNOWN = "UNKNOWN"
 STATIC = "STATIC"
@@ -177,23 +211,34 @@ RAISING = "RAISING"
 LOWERING = "LOWERING"
 FORWARD = "FORWARD"
 REVERSE = "REVERSE"
+DRIVER_PRESENT = "PRESENT"
+DRIVER_UNKNOWN = "UNKNOWN"
+RAW_DETECTED = "DETECTED"
+RAW_PREDICTED = "PREDICTED"
+RAW_MISSED = "MISSED"
 
 BEHAVIOR_UNKNOWN = "UNKNOWN"
 BEHAVIOR_IDLE = "IDLE"
 BEHAVIOR_NORMAL_TRAVEL = "NORMAL TRAVEL"
 BEHAVIOR_SAFE_FORK_OPERATION = "SAFE: FORK OPERATING WHILE STOPPED"
-BEHAVIOR_CAUTION_FORK_MOVING = "CAUTION: FORK OPERATING WHILE MOVING"
-BEHAVIOR_R7_REVERSE_LOWERING = "R7 VIOLATION: REVERSE + LOWERING"
-BEHAVIOR_R7_TURN_LOWERING = "R7 VIOLATION: TURN + LOWERING"
-BEHAVIOR_R7_REVERSE_TURN_LOWERING = (
-    "R7 VIOLATION: REVERSE + TURN + LOWERING"
-)
+BEHAVIOR_CAUTION_FORK_MOVING = "CAUTION: OPERATOR UNKNOWN"
+BEHAVIOR_UNSAFE_COMPOUND = "UNSAFE COMPOUND OPERATION"
+BEHAVIOR_R7_OPERATOR_UNKNOWN = "R7 CANDIDATE: OPERATOR UNKNOWN"
+BEHAVIOR_R7_REVERSE_LOWERING = "R7 VIOLATION: DRIVER + REVERSE + LOWERING"
+BEHAVIOR_R7_TURN_LOWERING = "R7 VIOLATION: DRIVER + TURN + LOWERING"
+BEHAVIOR_R7_REVERSE_TURN_LOWERING = "R7 VIOLATION: DRIVER + REVERSE + TURN + LOWERING"
 
 BEHAVIOR_LEVEL_UNKNOWN = "UNKNOWN"
 BEHAVIOR_LEVEL_NORMAL = "NORMAL"
 BEHAVIOR_LEVEL_SAFE = "SAFE"
 BEHAVIOR_LEVEL_CAUTION = "CAUTION"
+BEHAVIOR_LEVEL_UNSAFE_COMPOUND = "UNSAFE_COMPOUND"
 BEHAVIOR_LEVEL_R7 = "R7"
+
+SAFETY_SAFE = "SAFE"
+SAFETY_CAUTION = "CAUTION"
+SAFETY_UNSAFE = "UNSAFE"
+SAFETY_UNKNOWN = "UNKNOWN"
 
 
 @dataclass(frozen=True)
@@ -240,12 +285,29 @@ class TrackedDetection:
 
 
 @dataclass(frozen=True)
+class PersonDetection:
+    """One full-frame track from ROI detections and independent ByteTrack."""
+
+    track_id: int
+    bbox: tuple[float, float, float, float]
+    confidence: float
+    observed: bool = True
+    frames_since_observation: int = 0
+
+
+@dataclass(frozen=True)
 class DetectionProposal:
     """One physical-forklift proposal after fusing detector fragments."""
 
     bbox: tuple[float, float, float, float]
     confidence: float
     component_count: int = 1
+
+
+@dataclass(frozen=True)
+class PersonProposal:
+    bbox: tuple[float, float, float, float]
+    confidence: float
 
 
 @dataclass(frozen=True)
@@ -293,6 +355,18 @@ class CameraMotionEstimate:
     tracked_points: int = 0
     inliers: int = 0
     inlier_ratio: float = 0.0
+
+
+@dataclass
+class PersonTrackState:
+    """Short image-space history used only for driver motion consistency."""
+
+    track_id: int
+    motion_history: deque[MotionSample] = field(
+        default_factory=lambda: deque(maxlen=90)
+    )
+    last_seen_frame: int = -1
+    last_motion_frame: int = -1
 
 
 @dataclass
@@ -344,6 +418,9 @@ class TrackState:
     )
     fork_history: deque[HeightSample] = field(default_factory=lambda: deque(maxlen=120))
     direction_evidence: deque[str] = field(default_factory=lambda: deque(maxlen=90))
+    association_motion_history: deque[MotionSample] = field(
+        default_factory=lambda: deque(maxlen=90)
+    )
     last_seen_frame: int = -1
     last_motion_frame: int = -1
     last_raw_center: np.ndarray | None = None
@@ -357,6 +434,9 @@ class TrackState:
     stable_fork_state: str = UNKNOWN
 
     current_fork_state: str = UNKNOWN
+    display_fork_state: str = UNKNOWN
+    fork_raw_state: str = RAW_MISSED
+    fork_missing_frames: int = 0
     current_direction: str = UNKNOWN
     current_is_moving: bool | None = None
     current_is_turning: bool | None = None
@@ -367,15 +447,37 @@ class TrackState:
     turn_angle: float | None = None
     direction_cosine: float | None = None
 
+    driver_track_id: int | None = None
+    # driver_status is the stable display state kept through bounded gaps.
+    driver_status: str = DRIVER_UNKNOWN
+    driver_evidence_status: str = DRIVER_UNKNOWN
+    driver_raw_state: str = RAW_MISSED
+    driver_assoc_score: float | None = None
+    driver_confidence: float | None = None
+    driver_candidate_id: int | None = None
+    driver_candidate_frames: int = 0
+    driver_missing_frames: int = 0
+    driver_roi_overlap: float | None = None
+    driver_forklift_overlap: float | None = None
+    driver_motion_similarity: float | None = None
+    last_missing_update_frame: int = -1
+
     reverse_latch: TemporalLatch = field(default_factory=TemporalLatch)
     turn_latch: TemporalLatch = field(default_factory=TemporalLatch)
 
-    def mark_missing(self, release_frames: int) -> None:
-        """Invalidate current evidence and require a contiguous warm-up again."""
+    def mark_missing(
+        self,
+        frame_index: int,
+        driver_release_frames: int,
+        fork_gap_frames: int,
+    ) -> None:
+        """Invalidate rule evidence while retaining bounded display continuity."""
 
-        del release_frames  # UNKNOWN suppresses immediately; no release grace.
+        if self.last_missing_update_frame == frame_index:
+            return
+        self.last_missing_update_frame = frame_index
         self.motion_history.clear()
-        self.fork_history.clear()
+        self.association_motion_history.clear()
         self.direction_evidence.clear()
         self.last_motion_frame = -1
         self.last_raw_center = None
@@ -385,8 +487,13 @@ class TrackState:
         self.turn_true_frames = 0
         self.turn_false_frames = 0
         self.stable_direction = UNKNOWN
-        self.stable_fork_state = UNKNOWN
         self.current_fork_state = UNKNOWN
+        self.fork_raw_state = RAW_MISSED
+        self.fork_missing_frames += 1
+        if self.fork_missing_frames >= fork_gap_frames:
+            self.fork_history.clear()
+            self.stable_fork_state = UNKNOWN
+            self.display_fork_state = UNKNOWN
         self.current_direction = UNKNOWN
         self.current_is_moving = None
         self.current_is_turning = None
@@ -396,8 +503,46 @@ class TrackState:
         self.movement_displacement = None
         self.turn_angle = None
         self.direction_cosine = None
+        self.driver_evidence_status = DRIVER_UNKNOWN
+        self.driver_raw_state = RAW_MISSED
+        self.driver_candidate_id = None
+        self.driver_candidate_frames = 0
+        if self.driver_status == DRIVER_PRESENT and self.driver_track_id is not None:
+            self.driver_missing_frames += 1
+            if self.driver_missing_frames >= driver_release_frames:
+                self.driver_track_id = None
+                self.driver_status = DRIVER_UNKNOWN
+                self.driver_assoc_score = None
+                self.driver_confidence = None
+                self.driver_missing_frames = 0
+                self.driver_roi_overlap = None
+                self.driver_forklift_overlap = None
+                self.driver_motion_similarity = None
+        else:
+            self.driver_missing_frames = 0
         self.reverse_latch.invalidate()
         self.turn_latch.invalidate()
+
+
+@dataclass(frozen=True)
+class DriverAssociationEvidence:
+    forklift_track_id: int
+    person: PersonDetection
+    driver_roi: tuple[float, float, float, float]
+    score: float
+    roi_overlap: float
+    forklift_overlap: float
+    motion_similarity: float | None
+
+
+@dataclass(frozen=True)
+class ForkliftFrameRecord:
+    detection: TrackedDetection
+    crop_box: tuple[int, int, int, int]
+    fork: MaskObservation | None
+    mast: MaskObservation | None
+    state: TrackState
+    driver_roi: tuple[float, float, float, float]
 
 
 class OutputBoxStabilizer:
@@ -438,9 +583,7 @@ class OutputBoxStabilizer:
                         0.78,
                         0.12 if detection.observed else 0.35,
                     )
-                    size = previous_size + size_alpha * (
-                        growth_target - previous_size
-                    )
+                    size = previous_size + size_alpha * (growth_target - previous_size)
                     current = np.concatenate((center - size / 2.0, center + size / 2.0))
 
             bbox = clipped_bbox(current, frame_shape)
@@ -469,7 +612,7 @@ class OutputBoxStabilizer:
 
 
 def classify_behavior(state: TrackState) -> tuple[str, str]:
-    """Interpret the confirmed technical state without creating new evidence."""
+    """Interpret machine state and separately confirmed operator evidence."""
 
     reverse_violation = state.reverse_latch.active
     turn_violation = state.turn_latch.active
@@ -483,12 +626,29 @@ def classify_behavior(state: TrackState) -> tuple[str, str]:
 
     fork_state = state.current_fork_state
     is_moving = state.current_is_moving
+    machine_reverse_lowering = (
+        is_moving is True
+        and state.current_direction == REVERSE
+        and fork_state == LOWERING
+    )
+    machine_turn_lowering = (
+        is_moving is True
+        and state.current_is_turning is True
+        and fork_state == LOWERING
+    )
+    if (
+        machine_reverse_lowering or machine_turn_lowering
+    ) and state.driver_evidence_status != DRIVER_PRESENT:
+        return BEHAVIOR_R7_OPERATOR_UNKNOWN, BEHAVIOR_LEVEL_CAUTION
+
     if fork_state == UNKNOWN or is_moving is None:
         return BEHAVIOR_UNKNOWN, BEHAVIOR_LEVEL_UNKNOWN
     if fork_state in (RAISING, LOWERING):
         if is_moving is False:
             return BEHAVIOR_SAFE_FORK_OPERATION, BEHAVIOR_LEVEL_SAFE
         if is_moving is True:
+            if state.driver_evidence_status == DRIVER_PRESENT:
+                return BEHAVIOR_UNSAFE_COMPOUND, BEHAVIOR_LEVEL_UNSAFE_COMPOUND
             return BEHAVIOR_CAUTION_FORK_MOVING, BEHAVIOR_LEVEL_CAUTION
     if fork_state == STATIC:
         if is_moving is True:
@@ -496,6 +656,84 @@ def classify_behavior(state: TrackState) -> tuple[str, str]:
         if is_moving is False:
             return BEHAVIOR_IDLE, BEHAVIOR_LEVEL_NORMAL
     return BEHAVIOR_UNKNOWN, BEHAVIOR_LEVEL_UNKNOWN
+
+
+def classify_safety(state: TrackState) -> tuple[str, str]:
+    """Return a conservative, operator-facing safety decision and its reason."""
+
+    if state.reverse_latch.active and state.turn_latch.active:
+        return SAFETY_UNSAFE, "CONFIRMED DRIVER + REVERSE + TURN + LOWERING"
+    if state.reverse_latch.active:
+        return SAFETY_UNSAFE, "CONFIRMED DRIVER + REVERSE + LOWERING"
+    if state.turn_latch.active:
+        return SAFETY_UNSAFE, "CONFIRMED DRIVER + TURN + LOWERING"
+
+    fork_state = state.current_fork_state
+    is_moving = state.current_is_moving
+    machine_reverse_lowering = (
+        is_moving is True
+        and state.current_direction == REVERSE
+        and fork_state == LOWERING
+    )
+    machine_turn_lowering = (
+        is_moving is True
+        and state.current_is_turning is True
+        and fork_state == LOWERING
+    )
+    if (
+        machine_reverse_lowering or machine_turn_lowering
+    ) and state.driver_evidence_status != DRIVER_PRESENT:
+        return SAFETY_CAUTION, "MACHINE R7 CANDIDATE; OPERATOR UNKNOWN"
+
+    if is_moving is None and fork_state == UNKNOWN:
+        return SAFETY_UNKNOWN, "MISSING CURRENT MOTION AND FORK EVIDENCE"
+    if is_moving is None:
+        return SAFETY_UNKNOWN, "MISSING CURRENT MOTION EVIDENCE"
+
+    # All monitored R7/compound-operation rules require vehicle movement.  A
+    # current STOPPED estimate therefore rules them out even if fork masks are
+    # temporarily unavailable; this is SAFE only within this R7 rule scope.
+    if is_moving is False:
+        if fork_state in (RAISING, LOWERING):
+            return SAFETY_SAFE, "FORK ACTIVE WHILE VEHICLE STOPPED"
+        if fork_state == STATIC:
+            return SAFETY_SAFE, "IDLE; FORK STATIC"
+        return SAFETY_SAFE, "VEHICLE STOPPED; NO MOVING COMPOUND ACTION"
+
+    if fork_state == UNKNOWN:
+        return SAFETY_UNKNOWN, "MOVING BUT CURRENT FORK/MAST EVIDENCE IS MISSING"
+
+    if fork_state in (RAISING, LOWERING):
+        if state.driver_evidence_status == DRIVER_PRESENT:
+            return SAFETY_UNSAFE, "VEHICLE MOVING WHILE FORK ACTIVE"
+        return SAFETY_CAUTION, "MOVING + FORK ACTIVE; OPERATOR UNKNOWN"
+    if fork_state == STATIC:
+        return SAFETY_SAFE, "NORMAL TRAVEL; FORK STATIC"
+    return SAFETY_UNKNOWN, "INSUFFICIENT CURRENT EVIDENCE"
+
+
+def safety_color(status: str) -> tuple[int, int, int]:
+    if status == SAFETY_UNSAFE:
+        return ALERT_COLOR
+    if status == SAFETY_CAUTION:
+        return CAUTION_COLOR
+    if status == SAFETY_SAFE:
+        return NORMAL_COLOR
+    return UNKNOWN_COLOR
+
+
+def scene_safety_status(safety_counts: Mapping[str, int], active_tracks: int) -> str:
+    """Reduce per-forklift decisions to the most conservative scene state."""
+
+    if safety_counts.get(SAFETY_UNSAFE, 0):
+        return SAFETY_UNSAFE
+    if safety_counts.get(SAFETY_CAUTION, 0):
+        return SAFETY_CAUTION
+    if active_tracks == 0 or safety_counts.get(SAFETY_UNKNOWN, 0):
+        return SAFETY_UNKNOWN
+    if safety_counts.get(SAFETY_SAFE, 0):
+        return SAFETY_SAFE
+    return SAFETY_UNKNOWN
 
 
 def fork_operation_state(fork_state: str) -> str:
@@ -526,6 +764,20 @@ class RunStats:
     violation_frames: int = 0
     reverse_events: int = 0
     turn_events: int = 0
+    person_detections: int = 0
+    person_roi_crops: int = 0
+    person_track_rows: int = 0
+    person_detection_errors: int = 0
+    driver_association_frames: int = 0
+    driver_association_events: int = 0
+    machine_r7_candidate_frames: int = 0
+    operator_r7_frames: int = 0
+    safe_frames: int = 0
+    caution_frames: int = 0
+    unsafe_frames: int = 0
+    unknown_safety_frames: int = 0
+    driver_display_held_rows: int = 0
+    fork_display_held_rows: int = 0
 
 
 class GlobalMotionEstimator:
@@ -674,6 +926,9 @@ CSV_FIELDS = [
     "tracking_source",
     "frames_since_observation",
     "fork_state",
+    "fork_raw_state",
+    "fork_display_state",
+    "fork_evidence_state",
     "fork_operation",
     "fork_relative_height",
     "fork_slope",
@@ -685,8 +940,22 @@ CSV_FIELDS = [
     "reverse_lowering",
     "turn_lowering",
     "r7_violation",
+    "driver_status",
+    "driver_raw_state",
+    "driver_display_status",
+    "driver_evidence_status",
+    "driver_track_id",
+    "driver_confidence",
+    "driver_assoc_score",
+    "driver_roi_overlap",
+    "driver_forklift_overlap",
+    "driver_motion_similarity",
+    "operator_r7_confirmed",
+    "machine_r7_candidate",
     "behavior_level",
     "behavior",
+    "safety_status",
+    "safety_reason",
     "forklift_confidence",
     "fork_confidence",
     "mast_confidence",
@@ -720,8 +989,8 @@ def positive_int(value: str) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Track forklifts and detect temporal R7 unsafe double actions "
-            "(reverse+lowering or turning+lowering)."
+            "Track forklifts and people, associate drivers, and detect temporal "
+            "R7 unsafe double actions (reverse+lowering or turning+lowering)."
         )
     )
     parser.add_argument(
@@ -748,6 +1017,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Fork/mast segmentation checkpoint.",
     )
     parser.add_argument(
+        "--person-model",
+        default=str(PERSON_MODEL_PATH),
+        help="Full-frame person detection checkpoint.",
+    )
+    parser.add_argument(
         "--tracker",
         default=str(TRACKER_CONFIG_PATH),
         help="ByteTrack YAML path (generated from the constants above by default).",
@@ -768,6 +1042,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=positive_unit_interval,
         default=SEGMENTATION_CONF_THRESHOLD,
         help=f"Fork/mast segmentation confidence (default: {SEGMENTATION_CONF_THRESHOLD}).",
+    )
+    parser.add_argument(
+        "--person-conf",
+        type=positive_unit_interval,
+        default=PERSON_CONF_THRESHOLD,
+        help=f"Person detector confidence (default: {PERSON_CONF_THRESHOLD}).",
     )
     parser.add_argument(
         "--crop-padding",
@@ -916,6 +1196,23 @@ def create_fused_tracker(config: str) -> BYTETracker:
     return BYTETracker(args=tracker_args)
 
 
+def create_person_tracker(config: str, detector_confidence: float) -> BYTETracker:
+    """Create a second ByteTrack instance with an independent ID namespace."""
+
+    config_path = check_yaml(config)
+    tracker_args = IterableSimpleNamespace(**YAML.load(config_path))
+    if tracker_args.tracker_type != "bytetrack":
+        raise ValueError(
+            "Person tracking currently requires tracker_type=bytetrack; "
+            f"got {tracker_args.tracker_type!r} from {config_path}"
+        )
+    # The shared YAML is tuned for weak forklift fragments.  Person inference
+    # has already been filtered at its own CLI threshold, so any surviving
+    # observation may initialize a person track.
+    tracker_args.new_track_thresh = detector_confidence
+    return BYTETracker(args=tracker_args)
+
+
 def validate_model(model: YOLO, expected_task: str, path: Path) -> None:
     actual = str(getattr(model, "task", "")).casefold()
     if actual != expected_task:
@@ -1004,6 +1301,110 @@ def extract_detection_proposals(
             continue
         proposals.append(DetectionProposal((x1, y1, x2, y2), confidence))
     return proposals
+
+
+def extract_person_proposals(
+    result: Any,
+    person_class_id: int,
+    offset: tuple[int, int] = (0, 0),
+    frame_shape: tuple[int, ...] | None = None,
+) -> list[PersonProposal]:
+    """Extract person boxes and map an ROI result to full-frame coordinates."""
+
+    boxes = getattr(result, "boxes", None)
+    if boxes is None or len(boxes) == 0:
+        return []
+    xyxy = boxes.xyxy.detach().cpu().numpy()
+    confidences = boxes.conf.detach().cpu().numpy()
+    classes = boxes.cls.detach().cpu().numpy()
+    count = min(len(xyxy), len(confidences), len(classes))
+    proposals: list[PersonProposal] = []
+    for index in range(count):
+        values = np.asarray(xyxy[index], dtype=np.float64)
+        confidence = float(confidences[index])
+        class_value = float(classes[index])
+        if (
+            values.shape != (4,)
+            or not np.isfinite(values).all()
+            or not math.isfinite(confidence)
+            or not math.isfinite(class_value)
+            or int(round(class_value)) != person_class_id
+        ):
+            continue
+        x1, y1, x2, y2 = map(float, values)
+        mapped_bbox = (
+            x1 + offset[0],
+            y1 + offset[1],
+            x2 + offset[0],
+            y2 + offset[1],
+        )
+        if frame_shape is not None:
+            clipped = clipped_bbox(mapped_bbox, frame_shape)
+            if clipped is None:
+                continue
+            mapped_bbox = clipped
+        if mapped_bbox[2] > mapped_bbox[0] and mapped_bbox[3] > mapped_bbox[1]:
+            proposals.append(PersonProposal(mapped_bbox, confidence))
+    return proposals
+
+
+def expanded_person_roi(
+    forklift_bbox: tuple[float, float, float, float],
+    frame_shape: tuple[int, ...],
+) -> tuple[int, int, int, int] | None:
+    """Return a person-search crop expanded around one tracked forklift."""
+
+    x1, y1, x2, y2 = forklift_bbox
+    width, height = x2 - x1, y2 - y1
+    expanded = clipped_bbox(
+        (
+            x1 - PERSON_ROI_EXPAND_X * width,
+            y1 - PERSON_ROI_EXPAND_TOP * height,
+            x2 + PERSON_ROI_EXPAND_X * width,
+            y2 + PERSON_ROI_EXPAND_BOTTOM * height,
+        ),
+        frame_shape,
+    )
+    if expanded is None:
+        return None
+    ex1, ey1, ex2, ey2 = expanded
+    return (
+        int(math.floor(ex1)),
+        int(math.floor(ey1)),
+        int(math.ceil(ex2)),
+        int(math.ceil(ey2)),
+    )
+
+
+def deduplicate_person_proposals(
+    proposals: list[PersonProposal],
+) -> list[PersonProposal]:
+    """Remove duplicate full-frame boxes created by overlapping forklift ROIs."""
+
+    kept: list[PersonProposal] = []
+    for proposal in sorted(proposals, key=lambda item: item.confidence, reverse=True):
+        px1, py1, px2, py2 = proposal.bbox
+        proposal_area = max(1.0, (px2 - px1) * (py2 - py1))
+        duplicate = False
+        for accepted in kept:
+            ax1, ay1, ax2, ay2 = accepted.bbox
+            accepted_area = max(1.0, (ax2 - ax1) * (ay2 - ay1))
+            intersection = max(0.0, min(px2, ax2) - max(px1, ax1)) * max(
+                0.0, min(py2, ay2) - max(py1, ay1)
+            )
+            union = max(1.0, proposal_area + accepted_area - intersection)
+            iou = intersection / union
+            intersection_over_smaller = intersection / min(proposal_area, accepted_area)
+            if (
+                iou >= PERSON_ROI_DEDUP_IOU
+                or intersection_over_smaller
+                >= PERSON_ROI_DEDUP_INTERSECTION_OVER_SMALLER
+            ):
+                duplicate = True
+                break
+        if not duplicate:
+            kept.append(proposal)
+    return kept
 
 
 def box_intersection_metrics(
@@ -1116,6 +1517,22 @@ def detection_batch(
     )
 
 
+def person_detection_batch(
+    proposals: list[PersonProposal], person_class_id: int
+) -> DetectionBatch:
+    if not proposals:
+        return DetectionBatch(
+            np.empty((0, 4), dtype=np.float32),
+            np.empty((0,), dtype=np.float32),
+            np.empty((0,), dtype=np.float32),
+        )
+    return DetectionBatch(
+        np.asarray([item.bbox for item in proposals], dtype=np.float32),
+        np.asarray([item.confidence for item in proposals], dtype=np.float32),
+        np.full((len(proposals),), person_class_id, dtype=np.float32),
+    )
+
+
 def clipped_bbox(
     bbox: Sequence[float], frame_shape: tuple[int, ...]
 ) -> tuple[float, float, float, float] | None:
@@ -1160,9 +1577,7 @@ def track_fragments_are_compatible(
         math.hypot(bx2 - bx1, by2 - by1),
     )
     center_distance = float(np.linalg.norm(first_center - second_center)) / normalizer
-    _, x_overlap, y_overlap, _, _ = box_intersection_metrics(
-        first.bbox, second.bbox
-    )
+    _, x_overlap, y_overlap, _, _ = box_intersection_metrics(first.bbox, second.bbox)
     return center_distance <= 1.05 and max(x_overlap, y_overlap) >= 0.05
 
 
@@ -1262,9 +1677,7 @@ def update_fused_tracker(
             continue
         track_id = int(round(float(row[4])))
         active_ids.add(track_id)
-        detections.append(
-            TrackedDetection(track_id, bbox, float(row[5]), True, 0)
-        )
+        detections.append(TrackedDetection(track_id, bbox, float(row[5]), True, 0))
 
     # Ultralytics deliberately omits lost tracks from its result.  The internal
     # Kalman filter still predicts them, so draw a bounded, clearly marked box
@@ -1297,6 +1710,58 @@ def update_fused_tracker(
         for track in (*tracker.tracked_stracks, *tracker.lost_stracks)
     }
     return consolidate_tracked_detections(detections, track_lifetimes)
+
+
+def update_person_tracker(
+    tracker: BYTETracker,
+    proposals: list[PersonProposal],
+    person_class_id: int,
+    frame: np.ndarray,
+    prediction_frames: int,
+) -> list[PersonDetection]:
+    """Update person ByteTrack without any forklift-specific box fusion."""
+
+    tracked_rows = tracker.update(
+        person_detection_batch(proposals, person_class_id),
+        img=frame,
+    )
+    detections: list[PersonDetection] = []
+    active_ids: set[int] = set()
+    for raw_row in tracked_rows:
+        row = np.asarray(raw_row, dtype=np.float64)
+        if row.size < 8 or not np.isfinite(row[:6]).all():
+            continue
+        bbox = clipped_bbox(row[:4], frame.shape)
+        if bbox is None:
+            continue
+        track_id = int(round(float(row[4])))
+        active_ids.add(track_id)
+        detections.append(PersonDetection(track_id, bbox, float(row[5]), True, 0))
+
+    for track in tracker.lost_stracks:
+        track_id = int(track.track_id)
+        age = int(tracker.frame_id - track.frame_id)
+        if (
+            track_id in active_ids
+            or not track.is_activated
+            or age < 1
+            or age > prediction_frames
+        ):
+            continue
+        bbox = clipped_bbox(track.xyxy, frame.shape)
+        if bbox is None:
+            continue
+        decay = max(0.05, 1.0 - age / max(1.0, prediction_frames + 1.0))
+        detections.append(
+            PersonDetection(
+                track_id,
+                bbox,
+                float(track.score) * decay,
+                False,
+                age,
+            )
+        )
+    return sorted(detections, key=lambda item: item.track_id)
 
 
 def append_motion_sample(
@@ -1741,6 +2206,395 @@ def estimate_motion(state: TrackState, timestamp: float) -> MotionEstimate | Non
     )
 
 
+def append_association_motion_sample(
+    history: deque[MotionSample],
+    bbox: tuple[float, float, float, float],
+    timestamp: float,
+) -> None:
+    """Append an uncompensated center for person/forklift co-motion scoring."""
+
+    x1, y1, x2, y2 = bbox
+    history.append(
+        MotionSample(
+            timestamp,
+            (x1 + x2) / 2.0,
+            (y1 + y2) / 2.0,
+            x2 - x1,
+            y2 - y1,
+        )
+    )
+
+
+def intersection_over_subject_area(
+    subject: tuple[float, float, float, float],
+    container: tuple[float, float, float, float],
+) -> float:
+    """Intersection divided by subject area (appropriate for person boxes)."""
+
+    sx1, sy1, sx2, sy2 = subject
+    cx1, cy1, cx2, cy2 = container
+    subject_area = max(0.0, sx2 - sx1) * max(0.0, sy2 - sy1)
+    if subject_area <= 1.0:
+        return 0.0
+    intersection_width = max(0.0, min(sx2, cx2) - max(sx1, cx1))
+    intersection_height = max(0.0, min(sy2, cy2) - max(sy1, cy1))
+    return float(np.clip(intersection_width * intersection_height / subject_area, 0, 1))
+
+
+def estimate_driver_roi(
+    forklift_bbox: tuple[float, float, float, float],
+    fork_observation: MaskObservation | None,
+    crop_box: tuple[int, int, int, int],
+    frame_shape: tuple[int, ...],
+) -> tuple[float, float, float, float]:
+    """Estimate an orientation-aware cabin region from the current fork side."""
+
+    x1, y1, x2, y2 = forklift_bbox
+    width, height = x2 - x1, y2 - y1
+    vehicle_center_x = (x1 + x2) / 2.0
+    fork_x: float | None = None
+    if fork_observation is not None:
+        candidate_x = float(fork_observation.centroid[0] + crop_box[0])
+        if math.isfinite(candidate_x):
+            fork_x = candidate_x
+
+    if fork_x is None or abs(fork_x - vehicle_center_x) < 0.06 * width:
+        # Orientation fallback: central 70% of the vehicle.
+        roi_x1, roi_x2 = x1 + 0.15 * width, x2 - 0.15 * width
+    elif fork_x > vehicle_center_x:
+        # Fork/front is right, so prefer the left/center-left cabin.
+        roi_x1, roi_x2 = x1 + 0.05 * width, x1 + 0.68 * width
+    else:
+        # Fork/front is left, so prefer the right/center-right cabin.
+        roi_x1, roi_x2 = x1 + 0.32 * width, x2 - 0.05 * width
+
+    roi_y1, roi_y2 = y1, y1 + 0.78 * height
+    roi_x1 -= DRIVER_ROI_EXPAND_X * width
+    roi_x2 += DRIVER_ROI_EXPAND_X * width
+    roi_y1 -= DRIVER_ROI_EXPAND_Y * height
+    roi_y2 += DRIVER_ROI_EXPAND_Y * height
+    clipped = clipped_bbox((roi_x1, roi_y1, roi_x2, roi_y2), frame_shape)
+    return clipped if clipped is not None else forklift_bbox
+
+
+def driver_motion_similarity(
+    forklift_state: TrackState,
+    person_state: PersonTrackState,
+) -> float | None:
+    """Compare direction, normalized displacement, and relative image motion."""
+
+    if not forklift_state.association_motion_history or not person_state.motion_history:
+        return None
+    timestamp = min(
+        forklift_state.association_motion_history[-1].timestamp,
+        person_state.motion_history[-1].timestamp,
+    )
+    forklift_samples = recent_motion_samples(
+        forklift_state.association_motion_history, timestamp
+    )
+    person_samples = recent_motion_samples(person_state.motion_history, timestamp)
+    if (
+        len(forklift_samples) < DRIVER_MOTION_MIN_SAMPLES
+        or len(person_samples) < DRIVER_MOTION_MIN_SAMPLES
+        or forklift_samples[-1].timestamp - forklift_samples[0].timestamp
+        < DRIVER_MOTION_MIN_SPAN_SECONDS
+        or person_samples[-1].timestamp - person_samples[0].timestamp
+        < DRIVER_MOTION_MIN_SPAN_SECONDS
+    ):
+        return None
+    forklift_fit = linear_velocity(forklift_samples)
+    person_fit = linear_velocity(person_samples)
+    if forklift_fit is None or person_fit is None:
+        return None
+    forklift_velocity_raw, forklift_diagonal = forklift_fit
+    person_velocity_raw, _ = person_fit
+    if forklift_diagonal <= 1.0:
+        return None
+    forklift_velocity = forklift_velocity_raw / forklift_diagonal
+    person_velocity = person_velocity_raw / forklift_diagonal
+    forklift_speed = float(np.linalg.norm(forklift_velocity))
+    person_speed = float(np.linalg.norm(person_velocity))
+    if forklift_speed <= 1e-6 or person_speed <= 1e-6:
+        return None
+
+    cosine = float(
+        np.clip(
+            np.dot(forklift_velocity, person_velocity)
+            / (forklift_speed * person_speed),
+            -1.0,
+            1.0,
+        )
+    )
+    direction_score = max(0.0, cosine)
+    forklift_start, forklift_end = robust_endpoint(forklift_samples)
+    person_start, person_end = robust_endpoint(person_samples)
+    forklift_displacement = float(
+        np.linalg.norm(forklift_end - forklift_start) / forklift_diagonal
+    )
+    person_displacement = float(
+        np.linalg.norm(person_end - person_start) / forklift_diagonal
+    )
+    displacement_score = 1.0 - min(
+        1.0,
+        abs(person_displacement - forklift_displacement)
+        / max(forklift_displacement, MIN_NET_DISPLACEMENT),
+    )
+    relative_velocity = float(np.linalg.norm(person_velocity - forklift_velocity))
+    relative_score = math.exp(
+        -relative_velocity / max(forklift_speed, MOVING_ENTER_SPEED)
+    )
+    similarity = (
+        DRIVER_MOTION_DIRECTION_WEIGHT * direction_score
+        + DRIVER_MOTION_DISPLACEMENT_WEIGHT * displacement_score
+        + DRIVER_MOTION_RELATIVE_WEIGHT * relative_score
+    )
+    return float(np.clip(similarity, 0.0, 1.0))
+
+
+def compute_driver_association_score(
+    forklift_detection: TrackedDetection,
+    person_detection: PersonDetection,
+    driver_roi: tuple[float, float, float, float],
+    forklift_state: TrackState,
+    person_state: PersonTrackState,
+) -> float:
+    """Score one forklift/person pair from spatial, motion, and persistence cues."""
+
+    forklift_overlap = intersection_over_subject_area(
+        person_detection.bbox, forklift_detection.bbox
+    )
+    if forklift_overlap < DRIVER_MIN_PERSON_OVERLAP:
+        return 0.0
+    roi_overlap = intersection_over_subject_area(person_detection.bbox, driver_roi)
+    px1, py1, px2, py2 = person_detection.bbox
+    person_center = ((px1 + px2) / 2.0, (py1 + py2) / 2.0)
+    rx1, ry1, rx2, ry2 = driver_roi
+    center_in_roi = rx1 <= person_center[0] <= rx2 and ry1 <= person_center[1] <= ry2
+    roi_relation = max(
+        roi_overlap,
+        DRIVER_CENTER_RELATION_FLOOR if center_in_roi else 0.0,
+    )
+    temporal_consistency = (
+        1.0
+        if (
+            forklift_state.driver_track_id == person_detection.track_id
+            or forklift_state.driver_candidate_id == person_detection.track_id
+        )
+        else 0.0
+    )
+    weighted_sum = (
+        DRIVER_ROI_WEIGHT * roi_relation
+        + DRIVER_FORKLIFT_OVERLAP_WEIGHT * forklift_overlap
+        + DRIVER_TEMPORAL_WEIGHT * temporal_consistency
+    )
+    total_weight = (
+        DRIVER_ROI_WEIGHT + DRIVER_FORKLIFT_OVERLAP_WEIGHT + DRIVER_TEMPORAL_WEIGHT
+    )
+    if forklift_state.current_is_moving is True:
+        similarity = driver_motion_similarity(forklift_state, person_state)
+        weighted_sum += DRIVER_MOTION_WEIGHT * (
+            similarity if similarity is not None else 0.0
+        )
+        total_weight += DRIVER_MOTION_WEIGHT
+    return float(np.clip(weighted_sum / total_weight, 0.0, 1.0))
+
+
+def reset_driver_association(state: TrackState) -> None:
+    state.driver_track_id = None
+    state.driver_status = DRIVER_UNKNOWN
+    state.driver_evidence_status = DRIVER_UNKNOWN
+    state.driver_raw_state = RAW_MISSED
+    state.driver_assoc_score = None
+    state.driver_confidence = None
+    state.driver_candidate_id = None
+    state.driver_candidate_frames = 0
+    state.driver_missing_frames = 0
+    state.driver_roi_overlap = None
+    state.driver_forklift_overlap = None
+    state.driver_motion_similarity = None
+
+
+def update_driver_assignment(
+    state: TrackState,
+    evidence: DriverAssociationEvidence | None,
+    current_driver_observation: DriverAssociationEvidence | None,
+    predicted_driver: PersonDetection | None,
+    confirm_frames: int,
+    release_frames: int,
+) -> bool:
+    """Update stable display state while exposing only fresh observed evidence."""
+
+    state.driver_evidence_status = DRIVER_UNKNOWN
+    if evidence is not None or current_driver_observation is not None:
+        state.driver_raw_state = RAW_DETECTED
+    elif predicted_driver is not None:
+        state.driver_raw_state = RAW_PREDICTED
+    else:
+        state.driver_raw_state = RAW_MISSED
+
+    metric_source = evidence or current_driver_observation
+    if metric_source is not None:
+        state.driver_assoc_score = metric_source.score
+        state.driver_confidence = metric_source.person.confidence
+        state.driver_roi_overlap = metric_source.roi_overlap
+        state.driver_forklift_overlap = metric_source.forklift_overlap
+        state.driver_motion_similarity = metric_source.motion_similarity
+
+    if (
+        evidence is not None
+        and state.driver_status == DRIVER_PRESENT
+        and state.driver_track_id == evidence.person.track_id
+    ):
+        person_id = evidence.person.track_id
+        state.driver_evidence_status = DRIVER_PRESENT
+        state.driver_missing_frames = 0
+        state.driver_candidate_id = person_id
+        state.driver_candidate_frames = max(
+            state.driver_candidate_frames, confirm_frames
+        )
+        return False
+
+    if evidence is not None:
+        person_id = evidence.person.track_id
+        if state.driver_candidate_id == person_id:
+            state.driver_candidate_frames += 1
+        else:
+            state.driver_candidate_id = person_id
+            state.driver_candidate_frames = 1
+        if state.driver_candidate_frames >= confirm_frames:
+            state.driver_status = DRIVER_PRESENT
+            state.driver_evidence_status = DRIVER_PRESENT
+            state.driver_track_id = person_id
+            state.driver_missing_frames = 0
+            return True
+        if state.driver_status != DRIVER_PRESENT:
+            return False
+    else:
+        state.driver_candidate_id = None
+        state.driver_candidate_frames = 0
+
+    # No valid current observation for the confirmed pair: retain display only.
+    if state.driver_status == DRIVER_PRESENT and state.driver_track_id is not None:
+        state.driver_missing_frames += 1
+        if state.driver_missing_frames < release_frames:
+            return False
+    elif state.driver_status != DRIVER_PRESENT:
+        state.driver_missing_frames = 0
+
+    # A new candidate may be warming while the old display association expires.
+    candidate_id = state.driver_candidate_id
+    candidate_frames = state.driver_candidate_frames
+    reset_driver_association(state)
+    state.driver_candidate_id = candidate_id
+    state.driver_candidate_frames = candidate_frames
+    return False
+
+
+def associate_driver_tracks(
+    records: list[ForkliftFrameRecord],
+    people: list[PersonDetection],
+    person_states: Mapping[int, PersonTrackState],
+    confirm_frames: int,
+    release_frames: int,
+    inference_failed: bool,
+    inference_skipped: bool = False,
+) -> int:
+    """Greedily assign unique persons to forklifts by descending pair score."""
+    del inference_failed, inference_skipped
+
+    candidates: list[DriverAssociationEvidence] = []
+    observed_pairs: dict[tuple[int, int], DriverAssociationEvidence] = {}
+    for record in records:
+        for person in people:
+            if not person.observed:
+                continue
+            person_state = person_states.get(person.track_id)
+            if person_state is None:
+                continue
+            score = compute_driver_association_score(
+                record.detection,
+                person,
+                record.driver_roi,
+                record.state,
+                person_state,
+            )
+            roi_overlap = intersection_over_subject_area(person.bbox, record.driver_roi)
+            forklift_overlap = intersection_over_subject_area(
+                person.bbox, record.detection.bbox
+            )
+            pair_evidence = DriverAssociationEvidence(
+                record.detection.track_id,
+                person,
+                record.driver_roi,
+                score,
+                roi_overlap,
+                forklift_overlap,
+                driver_motion_similarity(record.state, person_state)
+                if record.state.current_is_moving is True
+                else None,
+            )
+            observed_pairs[(record.detection.track_id, person.track_id)] = pair_evidence
+            threshold = (
+                DRIVER_ASSOC_EXIT_SCORE
+                if record.state.driver_status == DRIVER_PRESENT
+                and record.state.driver_track_id == person.track_id
+                else DRIVER_ASSOC_ENTER_SCORE
+            )
+            if score >= threshold:
+                candidates.append(pair_evidence)
+
+    assignments: dict[int, DriverAssociationEvidence] = {}
+    used_people: set[int] = set()
+    state_by_forklift = {record.detection.track_id: record.state for record in records}
+    for evidence in sorted(
+        candidates,
+        key=lambda item: (
+            state_by_forklift[item.forklift_track_id].driver_status == DRIVER_PRESENT
+            and state_by_forklift[item.forklift_track_id].driver_track_id
+            == item.person.track_id,
+            item.score,
+        ),
+        reverse=True,
+    ):
+        if (
+            evidence.forklift_track_id in assignments
+            or evidence.person.track_id in used_people
+        ):
+            continue
+        assignments[evidence.forklift_track_id] = evidence
+        used_people.add(evidence.person.track_id)
+
+    activations = 0
+    people_by_id = {person.track_id: person for person in people}
+    for record in records:
+        display_driver_id = record.state.driver_track_id
+        current_driver_observation = (
+            observed_pairs.get((record.detection.track_id, display_driver_id))
+            if display_driver_id is not None
+            else None
+        )
+        tracked_driver = (
+            people_by_id.get(display_driver_id)
+            if display_driver_id is not None
+            else None
+        )
+        predicted_driver = (
+            tracked_driver
+            if tracked_driver is not None and not tracked_driver.observed
+            else None
+        )
+        activated = update_driver_assignment(
+            record.state,
+            assignments.get(record.detection.track_id),
+            current_driver_observation,
+            predicted_driver,
+            confirm_frames,
+            release_frames,
+        )
+        activations += int(activated)
+    return activations
+
+
 def update_turn_state(
     state: TrackState,
     estimate: MotionEstimate | None,
@@ -1851,6 +2705,42 @@ def classify_fork_state(state: TrackState, slope: float | None) -> str:
         classification = STATIC
     state.stable_fork_state = classification
     return classification
+
+
+def update_fork_temporal_state(
+    state: TrackState,
+    relative_height: float | None,
+    timestamp: float,
+    gap_tolerance_frames: int,
+) -> None:
+    """Separate fresh fork rule evidence from gap-tolerant display state."""
+
+    state.fork_relative_height = relative_height
+    if relative_height is not None:
+        state.fork_raw_state = RAW_DETECTED
+        state.fork_missing_frames = 0
+        state.fork_history.append(HeightSample(timestamp, relative_height))
+        recent_heights = [
+            sample
+            for sample in state.fork_history
+            if sample.timestamp >= timestamp - FORK_WINDOW_SECONDS
+        ]
+        state.fork_slope = robust_fork_slope(recent_heights)
+        state.current_fork_state = classify_fork_state(state, state.fork_slope)
+        if state.current_fork_state != UNKNOWN:
+            state.display_fork_state = state.current_fork_state
+        return
+
+    # A segmentation miss contributes no sample and immediately suppresses R7
+    # evidence, but it does not erase temporal history/display on one bad frame.
+    state.fork_raw_state = RAW_MISSED
+    state.current_fork_state = UNKNOWN
+    state.fork_slope = None
+    state.fork_missing_frames += 1
+    if state.fork_missing_frames >= gap_tolerance_frames:
+        state.fork_history.clear()
+        state.stable_fork_state = UNKNOWN
+        state.display_fork_state = UNKNOWN
 
 
 def instantaneous_direction(
@@ -2022,27 +2912,45 @@ def draw_header(
     active_tracks: int,
     active_violations: int,
     violation_frames: int,
+    safety_counts: Mapping[str, int],
 ) -> None:
-    header = (
+    scene_status = scene_safety_status(safety_counts, active_tracks)
+    safety_header = (
+        f"SCENE R7 SAFETY: {scene_status} | "
+        f"SAFE {safety_counts.get(SAFETY_SAFE, 0)} | "
+        f"CAUTION {safety_counts.get(SAFETY_CAUTION, 0)} | "
+        f"UNSAFE {safety_counts.get(SAFETY_UNSAFE, 0)} | "
+        f"UNKNOWN {safety_counts.get(SAFETY_UNKNOWN, 0)}"
+    )
+    detail_header = (
         f"R7 Unsafe Double Actions | Frame {frame_index} | Active forklifts: {active_tracks} | "
         f"Violations: {active_violations} | Violation frames: {violation_frames}"
     )
     font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 0.54
-    text_width = cv2.getTextSize(header, font, font_scale, 1)[0][0]
-    if text_width > frame.shape[1] - 18:
-        font_scale = max(0.32, font_scale * (frame.shape[1] - 18) / max(text_width, 1))
-    cv2.rectangle(frame, (0, 0), (frame.shape[1], 34), (12, 12, 12), -1)
-    cv2.putText(
-        frame,
-        header,
-        (9, 23),
-        font,
-        font_scale,
-        (245, 245, 245),
-        1,
-        cv2.LINE_AA,
-    )
+    cv2.rectangle(frame, (0, 0), (frame.shape[1], 60), (12, 12, 12), -1)
+    status_color = safety_color(scene_status)
+    cv2.rectangle(frame, (0, 0), (frame.shape[1] - 1, 59), status_color, 2)
+    for text, y, base_scale, color in (
+        (safety_header, 24, 0.62, status_color),
+        (detail_header, 49, 0.48, (235, 235, 235)),
+    ):
+        font_scale = base_scale
+        text_width = cv2.getTextSize(text, font, font_scale, 1)[0][0]
+        if text_width > frame.shape[1] - 18:
+            font_scale = max(
+                0.30,
+                font_scale * (frame.shape[1] - 18) / max(text_width, 1),
+            )
+        cv2.putText(
+            frame,
+            text,
+            (9, y),
+            font,
+            font_scale,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
 
 
 def csv_row(
@@ -2064,6 +2972,7 @@ def csv_row(
         active_rules.append("R7_REVERSE_LOWERING")
     if state.turn_latch.active:
         active_rules.append("R7_TURN_LOWERING")
+    safety_status, safety_reason = classify_safety(state)
     return {
         "frame": frame_index,
         "timestamp_sec": f"{timestamp:.3f}",
@@ -2071,6 +2980,9 @@ def csv_row(
         "tracking_source": "DETECTED" if detection.observed else "PREDICTED",
         "frames_since_observation": detection.frames_since_observation,
         "fork_state": state.current_fork_state,
+        "fork_raw_state": state.fork_raw_state,
+        "fork_display_state": state.display_fork_state,
+        "fork_evidence_state": state.current_fork_state,
         "fork_operation": fork_operation_state(state.current_fork_state),
         "fork_relative_height": format_optional(state.fork_relative_height, 6)
         if state.fork_relative_height is not None
@@ -2090,8 +3002,46 @@ def csv_row(
         "reverse_lowering": int(reverse_lowering),
         "turn_lowering": int(turn_lowering),
         "r7_violation": ";".join(active_rules) if active_rules else "NONE",
+        "driver_status": state.driver_status,
+        "driver_raw_state": state.driver_raw_state,
+        "driver_display_status": state.driver_status,
+        "driver_evidence_status": state.driver_evidence_status,
+        "driver_track_id": (
+            state.driver_track_id if state.driver_status == DRIVER_PRESENT else ""
+        ),
+        "driver_confidence": (
+            format_optional(state.driver_confidence, 5)
+            if state.driver_confidence is not None
+            else ""
+        ),
+        "driver_assoc_score": (
+            format_optional(state.driver_assoc_score, 5)
+            if state.driver_assoc_score is not None
+            else ""
+        ),
+        "driver_roi_overlap": (
+            format_optional(state.driver_roi_overlap, 5)
+            if state.driver_roi_overlap is not None
+            else ""
+        ),
+        "driver_forklift_overlap": (
+            format_optional(state.driver_forklift_overlap, 5)
+            if state.driver_forklift_overlap is not None
+            else ""
+        ),
+        "driver_motion_similarity": (
+            format_optional(state.driver_motion_similarity, 5)
+            if state.driver_motion_similarity is not None
+            else ""
+        ),
+        "operator_r7_confirmed": int(
+            state.reverse_latch.active or state.turn_latch.active
+        ),
+        "machine_r7_candidate": int(reverse_lowering or turn_lowering),
         "behavior_level": behavior_level,
         "behavior": behavior_label,
+        "safety_status": safety_status,
+        "safety_reason": safety_reason,
         "forklift_confidence": f"{detection.confidence:.5f}",
         "fork_confidence": f"{fork.confidence:.5f}" if fork is not None else "",
         "mast_confidence": f"{mast.confidence:.5f}" if mast is not None else "",
@@ -2118,8 +3068,11 @@ def print_progress(
     print(
         f"[progress] {stats.frames_processed}/{total_text} frames | "
         f"{processing_fps:.2f} FPS | tracks rows={stats.tracked_rows} | "
+        f"person rows={stats.person_track_rows} | "
         f"raw/fused={stats.raw_detections}/{stats.fused_proposals} | "
-        f"R7 frames={stats.violation_frames}",
+        f"R7 frames={stats.violation_frames} | "
+        f"safety S/C/U/?={stats.safe_frames}/{stats.caution_frames}/"
+        f"{stats.unsafe_frames}/{stats.unknown_safety_frames}",
         flush=True,
     )
 
@@ -2142,9 +3095,12 @@ def model_call_kwargs(device: str) -> dict[str, Any]:
 
 
 def process_video(args: argparse.Namespace) -> RunStats:
+    if PERSON_DETECT_EVERY_N_FRAMES <= 0:
+        raise ValueError("PERSON_DETECT_EVERY_N_FRAMES must be a positive integer")
     input_path = resolve_cli_path(str(args.input))
     detector_path = resolve_cli_path(str(args.forklift_model))
     segmenter_path = resolve_cli_path(str(args.r7_model))
+    person_model_path = resolve_cli_path(str(args.person_model))
     tracker_arg = str(args.tracker)
     output_path, events_path = derive_output_paths(
         input_path, args.output, args.output_csv
@@ -2154,6 +3110,7 @@ def process_video(args: argparse.Namespace) -> RunStats:
         ("input video", input_path),
         ("forklift model", detector_path),
         ("R7 segmentation model", segmenter_path),
+        ("person model", person_model_path),
     ):
         if not path.is_file():
             raise FileNotFoundError(f"{label.capitalize()} not found: {path}")
@@ -2213,8 +3170,9 @@ def process_video(args: argparse.Namespace) -> RunStats:
         print(f"Input:      {input_path}")
         print(f"Output:     {output_path}")
         print(f"Events CSV: {events_path}")
-        print(f"Detector:   {detector_path}")
-        print(f"Segmenter:  {segmenter_path}")
+        print(f"Forklift model: {detector_path}")
+        print(f"Fork/mast model: {segmenter_path}")
+        print(f"Person model:   {person_model_path}")
         print(f"Tracker:    {tracker_config} (fragment fusion + ByteTrack)")
         print(
             f"Video:      {frame_width}x{frame_height} @ {fps:.3f} FPS, "
@@ -2223,11 +3181,28 @@ def process_video(args: argparse.Namespace) -> RunStats:
         print(f"Device:     {resolved_device} (requested: {args.device})")
         print(
             f"Inference:  det_conf={args.forklift_conf}, seg_conf={args.seg_conf}, "
-            f"det_imgsz={IMAGE_SIZE}, seg_imgsz={SEGMENTATION_IMAGE_SIZE}"
+            f"person_conf={args.person_conf}, det_imgsz={IMAGE_SIZE}, "
+            f"seg_imgsz={SEGMENTATION_IMAGE_SIZE}, person_imgsz={PERSON_IMAGE_SIZE}"
         )
         print(
-            "Safety:     missing/ambiguous mask or motion evidence => UNKNOWN; "
-            "no R7 candidate"
+            "Person ROI: expanded per forklift "
+            f"(x={PERSON_ROI_EXPAND_X}, top={PERSON_ROI_EXPAND_TOP}, "
+            f"bottom={PERSON_ROI_EXPAND_BOTTOM}); full-frame person inference disabled"
+        )
+        print(
+            "Hysteresis: driver "
+            f"enter={DRIVER_ASSOC_ENTER_SCORE}, exit={DRIVER_ASSOC_EXIT_SCORE}, "
+            f"confirm={DRIVER_ASSOC_CONFIRM_SECONDS:.2f}s, "
+            f"release={DRIVER_ASSOC_RELEASE_SECONDS:.2f}s; "
+            f"fork gap={FORK_GAP_TOLERANCE_SECONDS:.2f}s"
+        )
+        print(
+            "Safety:     R7 compound-operation scope; SAFE only when current "
+            "evidence rules out the monitored conditions"
+        )
+        print(
+            "Evidence:   moving with missing/ambiguous fork evidence => UNKNOWN; "
+            "UNKNOWN is never treated as SAFE"
         )
         print(
             "Camera:     "
@@ -2247,8 +3222,10 @@ def process_video(args: argparse.Namespace) -> RunStats:
         print("Loading models once...")
         detector = YOLO(str(detector_path))
         segmenter = YOLO(str(segmenter_path))
+        person_detector = YOLO(str(person_model_path))
         validate_model(detector, "detect", detector_path)
         validate_model(segmenter, "segment", segmenter_path)
+        validate_model(person_detector, "detect", person_model_path)
         forklift_class_id = resolve_class_id(
             detector.names, {"forklift", "forklifts"}, "forklift detector"
         )
@@ -2256,6 +3233,9 @@ def process_video(args: argparse.Namespace) -> RunStats:
             segmenter.names, {"fork", "forks", "forktine", "forktines"}, "fork mask"
         )
         mast_class_id = resolve_class_id(segmenter.names, {"mast"}, "mast mask")
+        person_class_id = resolve_class_id(
+            person_detector.names, {"person", "persons"}, "person detector"
+        )
         if fork_class_id == mast_class_id:
             raise ValueError("Fork and mast classes resolve to the same class ID")
 
@@ -2272,14 +3252,20 @@ def process_video(args: argparse.Namespace) -> RunStats:
         csv_writer.writeheader()
 
         states: dict[int, TrackState] = {}
+        person_states: dict[int, PersonTrackState] = {}
         camera_estimator = GlobalMotionEstimator()
         fused_tracker = create_fused_tracker(tracker_config)
+        person_tracker = create_person_tracker(tracker_config, args.person_conf)
         max_missing_frames = frame_count_for(TRACK_STATE_TTL_SECONDS, fps)
         box_stabilizer = OutputBoxStabilizer(max_missing_frames)
         prediction_frames = frame_count_for(PREDICTED_TRACK_SECONDS, fps)
         release_frames = frame_count_for(R7_RELEASE_SECONDS, fps)
         confirm_frames = frame_count_for(R7_CONFIRM_SECONDS, fps)
+        driver_confirm_frames = frame_count_for(DRIVER_ASSOC_CONFIRM_SECONDS, fps)
+        driver_release_frames = frame_count_for(DRIVER_ASSOC_RELEASE_SECONDS, fps)
+        fork_gap_frames = frame_count_for(FORK_GAP_TOLERANCE_SECONDS, fps)
         call_kwargs = model_call_kwargs(resolved_device)
+        person_visual_cache: dict[int, tuple[PersonDetection, int]] = {}
         frame_index = 0
         stopped_early = False
 
@@ -2325,6 +3311,134 @@ def process_video(args: argparse.Namespace) -> RunStats:
             stats.predicted_track_rows += sum(
                 not detection.observed for detection in detections
             )
+
+            person_inference_failed = False
+            person_proposals: list[PersonProposal] = []
+            person_inference_performed = frame_index % PERSON_DETECT_EVERY_N_FRAMES == 0
+            if person_inference_performed:
+                person_roi_records: list[
+                    tuple[tuple[int, int, int, int], np.ndarray]
+                ] = []
+                seen_person_rois: set[tuple[int, int, int, int]] = set()
+                for forklift_detection in detections:
+                    person_roi = expanded_person_roi(
+                        forklift_detection.bbox, frame.shape
+                    )
+                    if person_roi is None or person_roi in seen_person_rois:
+                        continue
+                    roi_x1, roi_y1, roi_x2, roi_y2 = person_roi
+                    person_crop = frame[roi_y1:roi_y2, roi_x1:roi_x2]
+                    if person_crop.size == 0:
+                        continue
+                    seen_person_rois.add(person_roi)
+                    person_roi_records.append((person_roi, person_crop.copy()))
+                stats.person_roi_crops += len(person_roi_records)
+                try:
+                    if person_roi_records:
+                        person_results = person_detector.predict(
+                            [record[1] for record in person_roi_records],
+                            classes=[person_class_id],
+                            conf=args.person_conf,
+                            imgsz=PERSON_IMAGE_SIZE,
+                            verbose=False,
+                            **call_kwargs,
+                        )
+                        mapped_proposals: list[PersonProposal] = []
+                        for result_index, person_result in enumerate(person_results):
+                            if result_index >= len(person_roi_records):
+                                break
+                            person_roi = person_roi_records[result_index][0]
+                            mapped_proposals.extend(
+                                extract_person_proposals(
+                                    person_result,
+                                    person_class_id,
+                                    offset=(person_roi[0], person_roi[1]),
+                                    frame_shape=frame.shape,
+                                )
+                            )
+                        person_proposals = deduplicate_person_proposals(
+                            mapped_proposals
+                        )
+                except Exception as exc:
+                    person_inference_failed = True
+                    stats.person_detection_errors += 1
+                    if stats.person_detection_errors <= 3 or args.debug:
+                        print(
+                            f"[warning] Person detection failed at frame "
+                            f"{frame_index}: {exc}",
+                            file=sys.stderr,
+                        )
+            if person_inference_performed:
+                try:
+                    person_detections = update_person_tracker(
+                        person_tracker,
+                        person_proposals,
+                        person_class_id,
+                        frame,
+                        prediction_frames,
+                    )
+                except Exception as exc:
+                    person_inference_failed = True
+                    stats.person_detection_errors += 1
+                    person_tracker = create_person_tracker(
+                        tracker_config, args.person_conf
+                    )
+                    person_detections = []
+                    if stats.person_detection_errors <= 3 or args.debug:
+                        print(
+                            f"[warning] Person tracking failed at frame "
+                            f"{frame_index}: {exc}",
+                            file=sys.stderr,
+                        )
+            else:
+                # Do not advance ByteTrack with an artificial empty-detection
+                # frame: at N>1 that can prevent a new track from ever becoming
+                # activated.  The tracker resumes on the next inference frame;
+                # cached boxes are display-only and never association evidence.
+                person_detections = []
+                for person_id, (cached, observed_frame) in person_visual_cache.items():
+                    age = frame_index - observed_frame
+                    if age < 1 or age > prediction_frames:
+                        continue
+                    decay = max(
+                        0.05,
+                        1.0 - age / max(1.0, prediction_frames + 1.0),
+                    )
+                    person_detections.append(
+                        PersonDetection(
+                            person_id,
+                            cached.bbox,
+                            cached.confidence * decay,
+                            False,
+                            age,
+                        )
+                    )
+            person_detections = [
+                detection
+                for detection in person_detections
+                if detection.observed or detection.track_id in person_states
+            ]
+            stats.person_detections += len(person_proposals)
+            stats.person_track_rows += len(person_detections)
+            for person in person_detections:
+                if not person.observed:
+                    continue
+                person_visual_cache[person.track_id] = (person, frame_index)
+                person_state = person_states.setdefault(
+                    person.track_id, PersonTrackState(person.track_id)
+                )
+                if person_state.last_motion_frame != frame_index - 1:
+                    person_state.motion_history.clear()
+                append_association_motion_sample(
+                    person_state.motion_history, person.bbox, timestamp
+                )
+                person_state.last_motion_frame = frame_index
+                person_state.last_seen_frame = frame_index
+            for person_id, person_state in list(person_states.items()):
+                if frame_index - person_state.last_seen_frame > max_missing_frames:
+                    del person_states[person_id]
+                    person_visual_cache.pop(person_id, None)
+
             all_forklift_boxes = [proposal.bbox for proposal in fused_proposals]
             if args.disable_camera_compensation:
                 camera_motion = CameraMotionEstimate(True, None)
@@ -2347,11 +3461,15 @@ def process_video(args: argparse.Namespace) -> RunStats:
                 detection.track_id for detection in detections if detection.observed
             }
 
-            # Any gap breaks a candidate immediately.  Active alerts get only the
-            # short configured release grace, never new candidate credit.
+            # Any forklift gap suppresses rule evidence immediately; display-only
+            # driver/fork state is released by its own bounded hysteresis.
             for track_id, state in list(states.items()):
                 if track_id not in observed_track_ids:
-                    state.mark_missing(release_frames)
+                    state.mark_missing(
+                        frame_index,
+                        driver_release_frames,
+                        fork_gap_frames,
+                    )
                 if frame_index - state.last_seen_frame > max_missing_frames:
                     del states[track_id]
 
@@ -2400,7 +3518,10 @@ def process_video(args: argparse.Namespace) -> RunStats:
                         )
 
             frame_violation_track_ids: set[int] = set()
+            frame_machine_candidate_track_ids: set[int] = set()
+            frame_safety_counts: Counter[str] = Counter()
             processed_detection_ids: set[int] = set()
+            processed_records: list[ForkliftFrameRecord] = []
 
             for crop_index, (detection, crop_box, crop) in enumerate(crop_records):
                 processed_detection_ids.add(detection.track_id)
@@ -2440,6 +3561,11 @@ def process_video(args: argparse.Namespace) -> RunStats:
                     camera_motion,
                     compensate_camera=not args.disable_camera_compensation,
                 )
+                if state.last_seen_frame != frame_index - 1:
+                    state.association_motion_history.clear()
+                append_association_motion_sample(
+                    state.association_motion_history, detection.bbox, timestamp
+                )
                 state.last_seen_frame = frame_index
                 motion = estimate_motion(state, timestamp)
                 if motion is None:
@@ -2455,23 +3581,12 @@ def process_video(args: argparse.Namespace) -> RunStats:
                 state.turn_angle = motion.turn_angle if motion is not None else None
 
                 relative_height = relative_fork_height(fork, mast, bbox_height)
-                state.fork_relative_height = relative_height
-                if relative_height is not None:
-                    state.fork_history.append(HeightSample(timestamp, relative_height))
-                    recent_heights = [
-                        sample
-                        for sample in state.fork_history
-                        if sample.timestamp >= timestamp - FORK_WINDOW_SECONDS
-                    ]
-                    state.fork_slope = robust_fork_slope(recent_heights)
-                    state.current_fork_state = classify_fork_state(
-                        state, state.fork_slope
-                    )
-                else:
-                    state.fork_history.clear()
-                    state.stable_fork_state = UNKNOWN
-                    state.fork_slope = None
-                    state.current_fork_state = UNKNOWN
+                update_fork_temporal_state(
+                    state,
+                    relative_height,
+                    timestamp,
+                    fork_gap_frames,
+                )
 
                 instant_direction, direction_cosine = instantaneous_direction(
                     detection.bbox, crop_box, fork, mast, motion
@@ -2490,7 +3605,67 @@ def process_video(args: argparse.Namespace) -> RunStats:
                     fps,
                 )
 
+                driver_roi = estimate_driver_roi(
+                    detection.bbox,
+                    fork,
+                    crop_box,
+                    frame.shape,
+                )
+                processed_records.append(
+                    ForkliftFrameRecord(
+                        detection,
+                        crop_box,
+                        fork,
+                        mast,
+                        state,
+                        driver_roi,
+                    )
+                )
+
+            stats.driver_association_events += associate_driver_tracks(
+                processed_records,
+                person_detections,
+                person_states,
+                driver_confirm_frames,
+                driver_release_frames,
+                person_inference_failed,
+                inference_skipped=not person_inference_performed,
+            )
+
+            for record in processed_records:
+                detection = record.detection
+                crop_box = record.crop_box
+                fork = record.fork
+                mast = record.mast
+                state = record.state
+                x1, y1, x2, y2 = detection.bbox
+
+                machine_reverse_condition = tri_and(
+                    state.current_is_moving,
+                    None
+                    if state.current_direction == UNKNOWN
+                    else state.current_direction == REVERSE,
+                    None
+                    if state.current_fork_state == UNKNOWN
+                    else state.current_fork_state == LOWERING,
+                )
+                machine_turn_condition = tri_and(
+                    state.current_is_moving,
+                    state.current_is_turning,
+                    None
+                    if state.current_fork_state == UNKNOWN
+                    else state.current_fork_state == LOWERING,
+                )
+                reverse_lowering = machine_reverse_condition is True
+                turn_lowering = machine_turn_condition is True
+                if reverse_lowering or turn_lowering:
+                    frame_machine_candidate_track_ids.add(detection.track_id)
+
+                driver_evidence = (
+                    True if state.driver_evidence_status == DRIVER_PRESENT else None
+                )
                 reverse_condition = tri_and(
+                    driver_evidence,
                     state.current_is_moving,
                     None
                     if state.current_direction == UNKNOWN
@@ -2500,14 +3675,13 @@ def process_video(args: argparse.Namespace) -> RunStats:
                     else state.current_fork_state == LOWERING,
                 )
                 turn_condition = tri_and(
+                    driver_evidence,
                     state.current_is_moving,
                     state.current_is_turning,
                     None
                     if state.current_fork_state == UNKNOWN
                     else state.current_fork_state == LOWERING,
                 )
-                reverse_lowering = reverse_condition is True
-                turn_lowering = turn_condition is True
                 if reverse_condition is None:
                     state.reverse_latch.invalidate()
                 elif state.reverse_latch.update(
@@ -2524,19 +3698,24 @@ def process_video(args: argparse.Namespace) -> RunStats:
                     frame_violation_track_ids.add(detection.track_id)
 
                 behavior_label, behavior_level = classify_behavior(state)
-                fork_operation = fork_operation_state(state.current_fork_state)
+                safety_status, safety_reason = classify_safety(state)
+                frame_safety_counts[safety_status] += 1
+                fork_operation = fork_operation_state(state.display_fork_state)
+                if (
+                    state.driver_status == DRIVER_PRESENT
+                    and state.driver_evidence_status == DRIVER_UNKNOWN
+                ):
+                    stats.driver_display_held_rows += 1
+                if (
+                    state.display_fork_state != UNKNOWN
+                    and state.current_fork_state == UNKNOWN
+                ):
+                    stats.fork_display_held_rows += 1
 
                 blend_mask(frame, mast, crop_box, MAST_COLOR)
                 blend_mask(frame, fork, crop_box, FORK_COLOR)
 
-                if behavior_level == BEHAVIOR_LEVEL_R7:
-                    bbox_color = ALERT_COLOR
-                elif behavior_level == BEHAVIOR_LEVEL_CAUTION:
-                    bbox_color = CAUTION_COLOR
-                elif behavior_level in (BEHAVIOR_LEVEL_SAFE, BEHAVIOR_LEVEL_NORMAL):
-                    bbox_color = NORMAL_COLOR
-                else:
-                    bbox_color = UNKNOWN_COLOR
+                bbox_color = safety_color(safety_status)
                 draw_x1 = max(0, min(frame_width - 1, int(round(x1))))
                 draw_y1 = max(0, min(frame_height - 1, int(round(y1))))
                 draw_x2 = max(0, min(frame_width - 1, int(round(x2))))
@@ -2556,14 +3735,37 @@ def process_video(args: argparse.Namespace) -> RunStats:
                         else UNKNOWN
                     ),
                     f"Fork operation: {fork_operation}",
-                    f"Fork state: {state.current_fork_state}",
+                    f"Fork state: {state.display_fork_state}",
                     f"Direction: {state.current_direction}",
                     f"Turning: {tri_state(state.current_is_turning)}",
+                    f"Driver: {state.driver_status}",
+                    f"R7 Safety: {safety_status}",
+                    f"Reason: {safety_reason}",
                     f"Behavior: {behavior_label}",
                 ]
+                if (
+                    state.driver_status == DRIVER_PRESENT
+                    and state.driver_track_id is not None
+                ):
+                    lines.insert(
+                        -1,
+                        f"Driver ID: {state.driver_track_id}",
+                    )
+                    lines.insert(
+                        -1,
+                        f"Driver conf: {format_optional(state.driver_confidence, 2)} "
+                        f"assoc: {format_optional(state.driver_assoc_score, 2)}",
+                    )
                 if args.debug:
                     lines.extend(
                         [
+                            f"Driver raw: {state.driver_raw_state}",
+                            f"Driver display: {state.driver_status}",
+                            f"Driver evidence: {state.driver_evidence_status}",
+                            f"Assoc score: {format_optional(state.driver_assoc_score, 2)}",
+                            f"Fork raw: {state.fork_raw_state}",
+                            f"Fork display: {state.display_fork_state}",
+                            f"Fork evidence: {state.current_fork_state}",
                             f"fork_rel={format_optional(state.fork_relative_height)} "
                             f"slope={format_optional(state.fork_slope)}",
                             f"speed={format_optional(state.movement_speed)} "
@@ -2573,7 +3775,22 @@ def process_video(args: argparse.Namespace) -> RunStats:
                             "masks "
                             f"fork={format_optional(fork.confidence if fork else None, 2)} "
                             f"mast={format_optional(mast.confidence if mast else None, 2)}",
+                            "driver overlap "
+                            f"roi={format_optional(state.driver_roi_overlap, 2)} "
+                            f"vehicle={format_optional(state.driver_forklift_overlap, 2)}",
+                            "driver motion="
+                            f"{format_optional(state.driver_motion_similarity, 2)} "
+                            f"candidate={state.driver_candidate_id or 'N/A'} "
+                            f"frames={state.driver_candidate_frames}",
                         ]
+                    )
+                    roi_x1, roi_y1, roi_x2, roi_y2 = record.driver_roi
+                    cv2.rectangle(
+                        frame,
+                        (int(round(roi_x1)), int(round(roi_y1))),
+                        (int(round(roi_x2)), int(round(roi_y2))),
+                        DRIVER_COLOR,
+                        1,
                     )
                 draw_label_lines(frame, lines, (draw_x1, draw_y1), bbox_color)
 
@@ -2604,15 +3821,30 @@ def process_video(args: argparse.Namespace) -> RunStats:
                     )
                     if detection.observed:
                         state.last_seen_frame = frame_index
-                    state.mark_missing(release_frames)
+                    state.mark_missing(
+                        frame_index,
+                        driver_release_frames,
+                        fork_gap_frames,
+                    )
                     behavior_label, behavior_level = classify_behavior(state)
-                    fork_operation = fork_operation_state(state.current_fork_state)
+                    safety_status, safety_reason = classify_safety(state)
+                    frame_safety_counts[safety_status] += 1
+                    fork_operation = fork_operation_state(state.display_fork_state)
+                    if (
+                        state.driver_status == DRIVER_PRESENT
+                        and state.driver_evidence_status == DRIVER_UNKNOWN
+                    ):
+                        stats.driver_display_held_rows += 1
+                    if (
+                        state.display_fork_state != UNKNOWN
+                        and state.current_fork_state == UNKNOWN
+                    ):
+                        stats.fork_display_held_rows += 1
                     tracking_text = (
                         "DETECTED (invalid crop)"
                         if detection.observed
                         else (
-                            "PREDICTED "
-                            f"(+{detection.frames_since_observation} frames)"
+                            f"PREDICTED (+{detection.frames_since_observation} frames)"
                         )
                     )
                     suppression_text = (
@@ -2635,19 +3867,35 @@ def process_video(args: argparse.Namespace) -> RunStats:
                         track_color,
                         2,
                     )
+                    invalid_lines = [
+                        f"ID {detection.track_id} forklift {detection.confidence:.2f}",
+                        f"Track: {tracking_text}",
+                        "Motion: UNKNOWN",
+                        f"Fork operation: {fork_operation}",
+                        f"Fork state: {state.display_fork_state}",
+                        "Direction: UNKNOWN",
+                        "Turning: UNKNOWN",
+                        f"Driver: {state.driver_status}",
+                        f"R7 Safety: {safety_status}",
+                        f"Reason: {safety_reason}",
+                        f"Behavior: {behavior_label}",
+                        suppression_text,
+                    ]
+                    if args.debug:
+                        invalid_lines.extend(
+                            [
+                                f"Driver raw: {state.driver_raw_state}",
+                                f"Driver display: {state.driver_status}",
+                                "Driver evidence: UNKNOWN",
+                                f"Assoc score: {format_optional(state.driver_assoc_score, 2)}",
+                                f"Fork raw: {state.fork_raw_state}",
+                                f"Fork display: {state.display_fork_state}",
+                                "Fork evidence: UNKNOWN",
+                            ]
+                        )
                     draw_label_lines(
                         frame,
-                        [
-                            f"ID {detection.track_id} forklift {detection.confidence:.2f}",
-                            f"Track: {tracking_text}",
-                            "Motion: UNKNOWN",
-                            f"Fork operation: {fork_operation}",
-                            "Fork state: UNKNOWN",
-                            "Direction: UNKNOWN",
-                            "Turning: UNKNOWN",
-                            f"Behavior: {behavior_label}",
-                            suppression_text,
-                        ],
+                        invalid_lines,
                         (invalid_x1, invalid_y1),
                         track_color,
                     )
@@ -2669,16 +3917,92 @@ def process_video(args: argparse.Namespace) -> RunStats:
                     )
                     stats.tracked_rows += 1
 
+            associated_people = {
+                record.state.driver_track_id: record.detection.track_id
+                for record in processed_records
+                if record.state.driver_status == DRIVER_PRESENT
+                and record.state.driver_track_id is not None
+            }
+            forklift_by_id = {
+                record.detection.track_id: record.detection
+                for record in processed_records
+            }
+            for person in person_detections:
+                person_x1, person_y1, person_x2, person_y2 = person.bbox
+                person_draw_x1 = int(round(person_x1))
+                person_draw_y1 = int(round(person_y1))
+                person_draw_x2 = int(round(person_x2))
+                person_draw_y2 = int(round(person_y2))
+                forklift_id = associated_people.get(person.track_id)
+                person_color = (
+                    DRIVER_COLOR
+                    if forklift_id is not None
+                    else PERSON_COLOR
+                    if person.observed
+                    else PREDICTED_COLOR
+                )
+                cv2.rectangle(
+                    frame,
+                    (person_draw_x1, person_draw_y1),
+                    (person_draw_x2, person_draw_y2),
+                    person_color,
+                    1,
+                )
+                person_label = f"Person ID {person.track_id} {person.confidence:.2f}"
+                if forklift_id is not None:
+                    person_label += f" [DRIVER of F{forklift_id}]"
+                elif not person.observed:
+                    person_label += f" [PREDICTED +{person.frames_since_observation}]"
+                draw_label_lines(
+                    frame,
+                    [person_label],
+                    (person_draw_x1, person_draw_y1),
+                    person_color,
+                )
+                if args.debug and forklift_id is not None:
+                    forklift_detection = forklift_by_id.get(forklift_id)
+                    if forklift_detection is not None:
+                        fx1, fy1, fx2, fy2 = forklift_detection.bbox
+                        cv2.line(
+                            frame,
+                            (
+                                int(round((fx1 + fx2) / 2.0)),
+                                int(round((fy1 + fy2) / 2.0)),
+                            ),
+                            (
+                                int(round((person_x1 + person_x2) / 2.0)),
+                                int(round((person_y1 + person_y2) / 2.0)),
+                            ),
+                            DRIVER_COLOR,
+                            1,
+                            cv2.LINE_AA,
+                        )
+
             if detections:
                 stats.frames_with_tracks += 1
+            if associated_people:
+                stats.driver_association_frames += 1
+            if frame_machine_candidate_track_ids:
+                stats.machine_r7_candidate_frames += 1
             if frame_violation_track_ids:
                 stats.violation_frames += 1
+                stats.operator_r7_frames += 1
+            scene_status = scene_safety_status(frame_safety_counts, len(detections))
+            if scene_status == SAFETY_SAFE:
+                stats.safe_frames += 1
+            elif scene_status == SAFETY_CAUTION:
+                stats.caution_frames += 1
+            elif scene_status == SAFETY_UNSAFE:
+                stats.unsafe_frames += 1
+            else:
+                stats.unknown_safety_frames += 1
             draw_header(
                 frame,
                 frame_index,
                 len(detections),
                 len(frame_violation_track_ids),
                 stats.violation_frames,
+                frame_safety_counts,
             )
             writer.write(frame)
             stats.frames_processed += 1
@@ -2744,6 +4068,15 @@ def process_video(args: argparse.Namespace) -> RunStats:
             f"{stats.raw_detections} -> {stats.fused_proposals} proposals"
         )
         print(f"  Predicted track rows:   {stats.predicted_track_rows}")
+        print(f"  Person detections:      {stats.person_detections}")
+        print(f"  Person ROI crops:       {stats.person_roi_crops}")
+        print(f"  Person tracks:          {stats.person_track_rows}")
+        print(f"  Driver association frames: {stats.driver_association_frames}")
+        print(f"  Driver associations:    {stats.driver_association_events}")
+        print(f"  Driver display-held rows: {stats.driver_display_held_rows}")
+        print(f"  Fork display-held rows: {stats.fork_display_held_rows}")
+        if stats.person_detection_errors:
+            print(f"  Person detection errors: {stats.person_detection_errors}")
         print(f"  Segmentation crops:     {stats.segmentation_crops}")
         print(f"  Fork/mast paired hits:  {stats.paired_hits}")
         if not args.disable_camera_compensation:
@@ -2754,6 +4087,13 @@ def process_video(args: argparse.Namespace) -> RunStats:
             if stats.camera_motion_errors:
                 print(f"  Camera-motion errors:   {stats.camera_motion_errors}")
         print(f"  R7 violation frames:    {stats.violation_frames}")
+        print(f"  Machine R7 candidate frames: {stats.machine_r7_candidate_frames}")
+        print(f"  Confirmed operator R7 frames: {stats.operator_r7_frames}")
+        print(
+            "  Scene R7 safety frames: "
+            f"SAFE={stats.safe_frames}, CAUTION={stats.caution_frames}, "
+            f"UNSAFE={stats.unsafe_frames}, UNKNOWN={stats.unknown_safety_frames}"
+        )
         print(
             f"  R7 event activations:   {stats.reverse_events + stats.turn_events} "
             f"(reverse={stats.reverse_events}, turn={stats.turn_events})"
@@ -2765,6 +4105,16 @@ def process_video(args: argparse.Namespace) -> RunStats:
                 "[warning] No trustworthy fork+mast pair was found. Fork state and "
                 "R7 alerts correctly remain UNKNOWN/inactive. This usually indicates "
                 "a segmentation domain/crop mismatch, not a temporal-rule shortcut.",
+                file=sys.stderr,
+            )
+        if (
+            stats.frames_processed
+            and stats.unknown_safety_frames / stats.frames_processed >= 0.80
+        ):
+            print(
+                "[warning] R7 safety was UNKNOWN for at least 80% of frames. "
+                "Inspect fork/mast masks and motion warm-up before tuning the "
+                "safety rules; do not lower UNKNOWN to SAFE.",
                 file=sys.stderr,
             )
         return stats

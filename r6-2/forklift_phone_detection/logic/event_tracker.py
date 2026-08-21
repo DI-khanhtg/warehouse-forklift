@@ -5,6 +5,8 @@ import json
 from collections import Counter
 from pathlib import Path
 
+from .behaviors import canonical_behavior, is_using_phone_behavior
+
 
 EVENT_FIELDS = (
     "event_id", "start_time", "end_time", "duration", "behavior", "max_phone_confidence"
@@ -18,6 +20,7 @@ class EventTracker:
 
     def update(self, active: bool, timestamp: float, behavior: str, phone_confidence: float = 0.0):
         timestamp = max(0.0, float(timestamp))
+        behavior = canonical_behavior(behavior)
         if active and self.current is None:
             self.current = {
                 "event_id": len(self.events) + 1,
@@ -28,7 +31,7 @@ class EventTracker:
             }
         if active and self.current is not None:
             self.current["last_time"] = timestamp
-            if behavior and behavior != "NORMAL":
+            if is_using_phone_behavior(behavior):
                 self.current["behaviors"][behavior] += 1
             self.current["max_phone_confidence"] = max(
                 self.current["max_phone_confidence"], float(phone_confidence)

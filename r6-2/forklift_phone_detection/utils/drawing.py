@@ -56,6 +56,10 @@ def _format_distance(value) -> str:
     return "n/a" if value is None else f"{value:.2f}"
 
 
+def _yes_no(value) -> str:
+    return "YES" if value else "NO"
+
+
 def draw_annotations(
     frame,
     phone_detections,
@@ -109,17 +113,52 @@ def draw_annotations(
             cv2.line(frame, phone_center, target, evidence_color, 3, cv2.LINE_AA)
         height, width = frame.shape[:2]
         overlay = frame.copy()
-        bar_height = max(72, min(105, height // 7))
+        bar_height = max(150, min(190, height // 5))
         cv2.rectangle(overlay, (0, 0), (width, bar_height), (12, 12, 12), -1)
         frame[:] = cv2.addWeighted(overlay, 0.72, frame, 0.28, 0)
+        text_scale = max(0.55, min(0.85, width / 1500.0))
         cv2.putText(
             frame,
-            temporal.state,
-            (24, int(bar_height * 0.68)),
+            f"State: {temporal.state}",
+            (24, 42),
             cv2.FONT_HERSHEY_SIMPLEX,
-            max(0.8, min(1.4, width / 900.0)),
+            max(0.75, min(1.15, width / 1200.0)),
             state_color,
             3,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            frame,
+            f"Behavior: {temporal.behavior}",
+            (24, 78),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            text_scale,
+            (235, 235, 235),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            frame,
+            f"Phone: {temporal.phone_confidence:.2f}    "
+            f"Near head: {_yes_no(temporal.near_head)}    "
+            f"Near wrist: {_yes_no(temporal.near_wrist)}",
+            (24, 111),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            text_scale,
+            (235, 235, 235),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            frame,
+            f"Call evidence: {temporal.call_evidence:.2f}    "
+            f"Call duration: {temporal.call_duration:.1f}s    "
+            f"Phone missing: {temporal.phone_missing_duration:.1f}s",
+            (24, 143),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            text_scale,
+            (235, 235, 235),
+            2,
             cv2.LINE_AA,
         )
         if pose is not None and pose.get("track_id") is not None:
@@ -159,7 +198,7 @@ def draw_annotations(
         cv2.putText(
             frame,
             fps_text,
-            (max(10, width - text_width - 24), int(bar_height * 0.62)),
+            (max(10, width - text_width - 24), 39),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.65,
             (235, 235, 235),
@@ -231,6 +270,20 @@ def draw_annotations(
         _draw_pose_tracker(cv2, frame, pose)
 
     debug = instant.get("debug", {})
+    head_roi = debug.get("head_roi")
+    if show_debug_lines and head_roi is not None:
+        x1, y1, x2, y2 = (int(round(value)) for value in head_roi)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (200, 80, 255), 2)
+        cv2.putText(
+            frame,
+            "HEAD ROI",
+            (x1, max(18, y1 - 6)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (200, 80, 255),
+            1,
+            cv2.LINE_AA,
+        )
     if show_debug_lines and selected_phone is not None:
         phone_center = tuple(int(round(value)) for value in selected_phone["center"])
         hand_point = debug.get("nearest_hand_point")
@@ -244,20 +297,32 @@ def draw_annotations(
 
     height, width = frame.shape[:2]
     panel_width = min(500, max(350, width - 20))
-    panel_height = min(270, max(200, height - 20))
+    panel_height = min(345, max(260, height - 20))
     overlay = frame.copy()
     cv2.rectangle(overlay, (10, 10), (10 + panel_width, 10 + panel_height), (12, 12, 12), -1)
     frame[:] = cv2.addWeighted(overlay, 0.72, frame, 0.28, 0)
 
     cv2.putText(frame, "R6.2 Forklift Phone Detection", (25, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.67, (245, 245, 245), 2, cv2.LINE_AA)
-    cv2.putText(frame, temporal.state, (25, 85), cv2.FONT_HERSHEY_SIMPLEX, 1.15, state_color, 3, cv2.LINE_AA)
+    cv2.putText(
+        frame,
+        f"State: {temporal.state}",
+        (25, 85),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.0,
+        state_color,
+        3,
+        cv2.LINE_AA,
+    )
     lines = [
         f"Behavior: {temporal.behavior}",
-        f"Phone conf: {instant.get('phone_confidence', 0.0):.2f}",
-        f"Phone-Hand: {_format_distance(debug.get('phone_to_hand_distance'))}",
-        f"Phone-Head: {_format_distance(debug.get('phone_to_head_distance'))}",
-        f"Usage ratio: {temporal.usage_ratio:.2f} "
-        f"({temporal.covered_seconds:.1f}/{temporal.window_seconds:.1f} s)",
+        f"Behavior state: {temporal.behavior_state}",
+        f"Phone: {temporal.phone_confidence:.2f}",
+        f"Near head: {_yes_no(temporal.near_head)}    "
+        f"Near wrist: {_yes_no(temporal.near_wrist)}",
+        f"Call evidence: {temporal.call_evidence:.2f}",
+        f"Call duration: {temporal.call_duration:.1f}s",
+        f"Phone missing: {temporal.phone_missing_duration:.1f}s",
+        f"Release timer: {temporal.release_duration:.1f}s",
         f"Duration: {event_duration:.1f} s    FPS: {processing_fps:.1f}",
     ]
     y = 116

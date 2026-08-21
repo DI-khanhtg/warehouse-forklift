@@ -6,6 +6,7 @@ from collections import deque
 from typing import Optional
 
 from .config import Settings
+from .logic.behavior_state import BehaviorStateMachine
 from .logic.event_tracker import EventTracker
 from .logic.geometry import (
     is_point_inside_bbox,
@@ -16,7 +17,6 @@ from .logic.geometry import (
 from .logic.phone_usage import classify_phone_usage
 from .logic.pose_tracker import DriverPoseTracker
 from .logic.search_rois import generate_phone_search_rois
-from .logic.temporal_filter import TemporalFilter
 from .models.phone_detector import PhoneDetector
 from .models.pose_detector import PoseDetector
 from .utils.drawing import draw_annotations
@@ -45,13 +45,18 @@ class PhoneUsagePipeline:
             settings.pose_image_size,
             settings.device,
         )
-        self.temporal = TemporalFilter(
-            fps=self.source_fps,
-            window_seconds=settings.temporal_window_seconds,
-            alert_on_ratio=settings.alert_on_ratio,
-            alert_off_ratio=settings.alert_off_ratio,
-            min_window_fill_ratio=settings.min_window_fill_ratio,
+        self.log = logging.getLogger("r6_phone_detection")
+        self.behavior_state_machine = BehaviorStateMachine(
+            call_trigger_time=settings.call_trigger_time,
+            handheld_trigger_time=settings.handheld_trigger_time,
+            watching_trigger_time=settings.watching_trigger_time,
+            usage_release_time=settings.usage_release_time,
+            call_release_time=settings.call_release_time,
+            logger=self.log,
         )
+        # Compatibility alias for callers that consumed result["temporal"] or
+        # pipeline.temporal before the behavior state-machine upgrade.
+        self.temporal = self.behavior_state_machine
         self.events = EventTracker()
         self.processing_times = deque(maxlen=30)
         self.processed_frames = 0
@@ -59,7 +64,6 @@ class PhoneUsagePipeline:
         self.raw_phone_candidates_count = 0
         self.low_confidence_phone_candidates_count = 0
         self.last_timestamp = 0.0
-        self.log = logging.getLogger("r6_phone_detection")
         self.active_track_id = None
         self.pose_tracker = None
         if settings.enable_driver_tracking:
@@ -193,10 +197,10 @@ class PhoneUsagePipeline:
         identity_changed = False
         if self.active_track_id is not None and current_track_id != self.active_track_id:
             identity_changed = True
-            self.temporal.reset()
+            self.behavior_state_machine.reset()
             self.events.update(False, timestamp, "NORMAL", 0.0)
             self.log.info(
-                "Driver track changed: %s -> %s; temporal evidence reset",
+                "Driver track changed: %s -> %s; behavior evidence and PhoneTrack reset",
                 self.active_track_id,
                 current_track_id,
             )
@@ -240,15 +244,21 @@ class PhoneUsagePipeline:
         else:
             candidate_status = "no_candidate"
 
-        instant = classify_phone_usage(phones, logic_pose, frame.shape, self.settings)
-        temporal = self.temporal.update(
-            instant["using_phone"], instant["behavior"], timestamp=timestamp
+        instant = classify_phone_usage(
+            phones,
+            logic_pose,
+            frame.shape,
+            self.settings,
+            tracked_phone_bbox=self.behavior_state_machine.phone_track.last_bbox,
+        )
+        behavior_result = self.behavior_state_machine.update(
+            instant, timestamp=timestamp
         )
         self.events.update(
-            temporal.state == "USING_PHONE",
+            behavior_result.state == "USING_PHONE",
             timestamp,
-            temporal.behavior,
-            instant.get("phone_confidence", 0.0),
+            behavior_result.behavior,
+            behavior_result.phone_confidence,
         )
         elapsed = max(time.perf_counter() - started, 1e-9)
         self.processing_times.append(elapsed)
@@ -276,7 +286,7 @@ class PhoneUsagePipeline:
             phones,
             pose,
             instant,
-            temporal,
+            behavior_result,
             processing_fps,
             self.events.current_duration,
             roi=roi_box,
@@ -313,7 +323,9 @@ class PhoneUsagePipeline:
             "driver_track_id": current_track_id,
             "driver_identity_changed": identity_changed,
             "instant": instant,
-            "temporal": temporal,
+            "temporal": behavior_result,
+            "behavior_state": behavior_result,
+            "phone_track": self.behavior_state_machine.phone_track,
             "processing_fps": processing_fps,
             "timestamp": timestamp,
         }

@@ -1,5 +1,5 @@
 from forklift_phone_detection.config import Settings
-from forklift_phone_detection.logic.phone_usage import classify_phone_usage
+from forklift_phone_detection.logic.phone_usage import build_head_roi, classify_phone_usage
 
 
 def pose():
@@ -30,15 +30,47 @@ def test_phone_near_ear_is_phone_call():
 def test_phone_near_wrist_is_holding_phone():
     result = classify_phone_usage([phone_at(195, 305)], pose(), (480, 640, 3))
     assert result["using_phone"]
-    assert result["behavior"] == "TEXTING_OR_HOLDING_PHONE"
+    assert result["behavior"] == "HANDHELD_PHONE_USE"
 
 
 def test_visible_phone_without_interaction_is_normal():
     result = classify_phone_usage([phone_at(480, 450)], pose(), (480, 640, 3))
     assert not result["using_phone"]
-    assert result["behavior"] == "NORMAL"
+    assert result["behavior"] == "PHONE_PRESENT"
+
+
+def test_phone_in_front_of_face_has_independent_watching_pathway():
+    result = classify_phone_usage([phone_at(250, 240)], pose(), (480, 640, 3))
+    assert result["using_phone"]
+    assert result["behavior"] == "WATCHING_PHONE"
+    assert result["pathways"]["WATCHING_PHONE"]
+    assert not result["pathways"]["HANDHELD_PHONE_USE"]
 
 
 def test_no_pose_fails_gracefully_to_normal():
     result = classify_phone_usage([phone_at(215, 115)], None, (480, 640, 3), Settings())
     assert not result["using_phone"]
+
+
+def test_head_roi_recovers_call_when_ear_keypoints_are_missing():
+    unstable_pose = pose()
+    unstable_pose["keypoints"] = {
+        name: value
+        for name, value in unstable_pose["keypoints"].items()
+        if "ear" not in name
+    }
+    unstable_pose["keypoints"].update({
+        "nose": (250, 112, 0.9),
+        "left_eye": (230, 100, 0.9),
+        "right_eye": (270, 100, 0.9),
+    })
+    head_roi = build_head_roi(unstable_pose, (480, 640, 3))
+    result = classify_phone_usage(
+        [phone_at(head_roi[0] + 5, (head_roi[1] + head_roi[3]) / 2)],
+        unstable_pose,
+        (480, 640, 3),
+    )
+    assert result["behavior"] == "PHONE_CALL"
+    assert result["using_phone"]
+    assert result["debug"]["phone_near_head_roi"]
+    assert result["debug"]["head_roi"] == head_roi

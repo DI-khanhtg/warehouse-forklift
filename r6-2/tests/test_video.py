@@ -1,6 +1,17 @@
 import numpy as np
 
-from forklift_phone_detection.utils.video import resize_with_letterbox
+from forklift_phone_detection.utils.video import downscale_to_width, resize_with_letterbox
+
+
+def test_downscale_to_width_preserves_aspect_ratio():
+    frame = np.full((2160, 3840, 3), 255, dtype=np.uint8)
+    output = downscale_to_width(frame, 1920)
+    assert output.shape == (1080, 1920, 3)
+
+
+def test_downscale_to_width_does_not_upscale():
+    frame = np.full((720, 1280, 3), 255, dtype=np.uint8)
+    assert downscale_to_width(frame, 1920) is frame
 
 
 def test_resize_with_letterbox_produces_hd_without_distortion():
