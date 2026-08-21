@@ -24,6 +24,22 @@ def default_video_output(source) -> Path:
     return Path("output") / f"{source.stem}_annotated.mp4"
 
 
+def downscale_to_width(frame, max_width: int):
+    """Downscale a frame to ``max_width`` while preserving its aspect ratio."""
+    import cv2
+
+    source_height, source_width = frame.shape[:2]
+    if source_width <= 0 or source_height <= 0:
+        raise ValueError("Cannot resize an empty frame")
+    if max_width <= 0:
+        raise ValueError("Downscale width must be positive")
+    if source_width <= max_width:
+        return frame
+    scale = max_width / source_width
+    resized_height = max(1, int(round(source_height * scale)))
+    return cv2.resize(frame, (max_width, resized_height), interpolation=cv2.INTER_AREA)
+
+
 def resize_with_letterbox(frame, width: int = 1280, height: int = 720):
     """Fit a frame into an exact output size without changing its aspect ratio."""
     import cv2

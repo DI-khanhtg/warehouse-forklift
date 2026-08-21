@@ -30,3 +30,4 @@ def test_finalize_open_event():
     tracker.update(True, 5.0, "TEXTING_OR_HOLDING_PHONE", 0.8)
     tracker.finalize(7.5)
     assert tracker.events[0]["duration"] == 2.5
+    assert tracker.events[0]["behavior"] == "HANDHELD_PHONE_USE"

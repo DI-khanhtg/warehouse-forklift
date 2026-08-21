@@ -117,7 +117,7 @@ def test_local_roi_recovers_phone_and_can_trigger_temporal_alert():
     _, second = pipeline.process_frame(frame.copy(), 0.5)
     _, third = pipeline.process_frame(frame.copy(), 1.0)
     assert first["phones"][0]["source"] == "left_wrist_roi"
-    assert first["instant"]["behavior"] == "TEXTING_OR_HOLDING_PHONE"
+    assert first["instant"]["behavior"] == "HANDHELD_PHONE_USE"
     assert first["wrist_phone_detected"]
     assert second["temporal"].state == "NORMAL"
     assert third["temporal"].state == "USING_PHONE"

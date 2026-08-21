@@ -1,6 +1,6 @@
 # R6.2 Forklift Cockpit Phone-Use Detection PoC
 
-An explainable baseline that detects whether a forklift operator is using a phone. It combines a pretrained COCO phone detector, a pretrained pose model, pose-assisted high-resolution phone crops, normalized spatial rules, and a sliding temporal filter. No custom training or action-recognition network is used.
+An explainable baseline that detects whether a forklift operator is using a phone. It combines a pretrained COCO phone detector, a pretrained pose model, pose-assisted high-resolution phone crops, normalized spatial rules, and a timestamp-driven behavior state machine. No custom training or action-recognition network is used.
 
 ## How it works
 
@@ -24,11 +24,11 @@ full-frame phone YOLO      YOLO pose
                     v
              IoU deduplication
                     v
-       normalized spatial rules
-       phone near hand/head?
+       independent behavior evidence
+       call / handheld / watching
                   |
                   v
-       sliding window + hysteresis
+       per-behavior timers + hysteresis
                   |
                   v
        NORMAL / USING_PHONE
@@ -36,7 +36,7 @@ full-frame phone YOLO      YOLO pose
           annotated MP4 + events
 ```
 
-Phone visibility by itself is **not** a violation. The baseline requires evidence that the phone is near a wrist or head. Distances and search regions are normalized using shoulder width, with person-box/frame fallbacks. `PHONE_CALL` has priority over `TEXTING_OR_HOLDING_PHONE`.
+Phone visibility by itself is **not** a violation. `PHONE_CALL`, `HANDHELD_PHONE_USE`, and `WATCHING_PHONE` are independent positive pathways. Calls use phone-to-head evidence and do not require phone-hand proximity. A scale-aware head ROI is built from nose/eye/ear points with a person-box fallback. `PhoneTrack` retains the last box, confidence, timestamp, behavior, near-head status, and associated wrist so established calls survive brief detector occlusion when a hand remains near the head.
 
 ## Installation
 
@@ -101,7 +101,7 @@ Choose an output path or tune thresholds without editing source:
 ```bash
 python infer_video.py --source input/cockpit_test.mp4 --output output/result.mp4 \
   --phone-model yolo11s.pt --phone-image-size 960 \
-  --hand-threshold 0.6 --head-threshold 0.7 --alert-on-ratio 0.6
+  --hand-threshold 0.6 --head-threshold 0.7 --call-trigger-seconds 0.6
 ```
 
 PowerShell uses a backtick instead of `\` for multiline commands. Add `--preview` to display the annotated result while processing. Press `q` to stop the preview.
@@ -112,7 +112,16 @@ PowerShell uses a backtick instead of `\` for multiline commands. Add `--preview
 python infer_camera.py --camera 0
 ```
 
-Press `q` to exit. Camera inference uses exactly the same models, rules, filter, annotations, and event tracker as video inference.
+Press `q` to exit. Camera inference uses exactly the same models, rules, state machine, annotations, and event tracker as video inference.
+
+The camera entrypoint can also process a video file. This example downsizes 4K
+frames to 1920 pixels wide before tracking and saves a Full HD annotated video:
+
+```bash
+python infer_camera.py --source input/phone_r6.mp4 \
+  --processing-width 1920 --display-size 1920x1080 \
+  --output output/phone_r6_tracked_1920.mp4
+```
 
 The live window also defaults to HD `1280x720` with the `phone_only` overlay:
 
@@ -159,13 +168,15 @@ Defaults are centralized in `forklift_phone_detection/config.py`:
 | Keypoint max jump | 0.85 | Reject isolated joint jumps, normalized by body scale |
 | Hand distance | 0.60 | Phone-to-wrist distance / shoulder width |
 | Head distance | 0.70 | Phone-to-ear/head distance / shoulder width |
-| Window | 1.5 s | Timestamp-based temporal history duration |
-| Alert on | 0.60 | Positive ratio that activates the alert |
-| Alert off | 0.30 | Ratio that clears an active alert |
+| Call trigger | 0.6 s | Continuous near-head evidence required for `CALLING` |
+| Handheld trigger | 1.0 s | Continuous handheld evidence required for `HANDHELD` |
+| Watching trigger | 1.5 s | Continuous viewing-region evidence required for `WATCHING` |
+| Usage release | 0.7 s | Continuous insufficient evidence before clearing `USING_PHONE` |
+| Call miss retention | 0.7 s | Retain an established call during phone occlusion with hand near head |
 
-The phone class number is not hardcoded; it is located by searching `model.names` for `cell phone`. Full-frame and local-crop candidates are merged with IoU NMS. Every accepted detection records `full_frame`, `left_wrist_roi`, `right_wrist_roi`, `both_hands_roi`, or `head_roi` as its source. The temporal window uses actual timestamps rather than camera-reported FPS; it must be at least half filled and contain at least two observations before it can alert.
+The phone class number is not hardcoded; it is located by searching `model.names` for `cell phone`. Full-frame and local-crop candidates are merged with IoU NMS. Every accepted detection records `full_frame`, `left_wrist_roi`, `right_wrist_roi`, `both_hands_roi`, or `head_roi` as its source. The state machine uses source timestamps rather than processed frame counts, so behavior duration remains correct when inference FPS differs from video FPS. Legacy labels such as `PHONE_NEAR_HEAD`, `CALLING`, and `TEXTING_OR_HOLDING_PHONE` are normalized before fusion.
 
-Driver tracking uses the previous operator bbox to select the next pose, rejects implausible person jumps and isolated wrist/elbow jumps, corrects transient left/right arm swaps, and smooths accepted joints. A temporarily missing/rejected pose is drawn in gray as `HELD`, but it is display-only and cannot generate phone-use evidence. When the driver identity changes, temporal votes are cleared so evidence from two different people cannot be combined.
+Driver tracking uses the previous operator bbox to select the next pose, rejects implausible person jumps and isolated wrist/elbow jumps, corrects transient left/right arm swaps, and smooths accepted joints. A temporarily missing/rejected pose is drawn in gray as `HELD`, but it is display-only and cannot generate phone-use evidence. When the driver identity changes, behavior evidence and `PhoneTrack` are reset so evidence from two different people cannot be combined.
 
 Useful switches:
 
@@ -191,9 +202,11 @@ Useful switches:
 --pose-keypoint-max-jump FLOAT
 --hand-threshold FLOAT
 --head-threshold FLOAT
---window-seconds FLOAT
---alert-on-ratio FLOAT
---alert-off-ratio FLOAT
+--call-trigger-seconds FLOAT
+--handheld-trigger-seconds FLOAT
+--watching-trigger-seconds FLOAT
+--usage-release-seconds FLOAT
+--call-release-seconds FLOAT
 --image-size INT
 --device auto|cpu|0|cuda:0
 --allow-phone-outside-body
@@ -247,7 +260,7 @@ Every video run also saves a JSON summary containing duration, frames, detector 
 pytest -q
 ```
 
-Tests cover geometry, normalized scale, instantaneous rules, sliding windows, hysteresis, merged events, CSV output, and event evaluation. They do not download YOLO weights.
+Tests cover geometry, normalized scale, independent behavior rules, alias normalization, timestamp activation, call occlusion persistence, hysteresis, merged events, CSV output, and event evaluation. They do not download YOLO weights.
 
 ## Manual test checklist
 
@@ -275,8 +288,8 @@ For each video, record duration, frames, phone detections, true/detected/false e
 - Pose keypoints can fail under occlusion, unusual camera angles, PPE, vibration, and low light.
 - The initial normalized thresholds and pose-crop scale are starting values, not calibrated safety limits.
 - Full-frame inference plus up to four batched pose crops is substantially slower on CPU; CUDA is recommended for a real-time demo.
-- The output event begins when the temporal alert activates, so measured detection delay includes the intentional persistence window.
+- The output event begins when its behavior timer activates, so measured detection delay includes the configured call/handheld/watching trigger time.
 
 ## Recommended next experiment
 
-Run `debug_phone.py` on known missed-phone frames, then process representative fixed-camera videos covering T01-T12 with saved debug frames. Compare model size, full/crop image size, and ROI scale before tuning hand/head distances and the temporal ratio. Select settings that maximize `USING_PHONE` recall while keeping false alarms per hour acceptable. Only after measuring this enhanced pretrained baseline should a custom phone-detector fine-tune be considered.
+Run `debug_phone.py` on known missed-phone frames, then process representative fixed-camera videos covering T01-T12 with saved debug frames. Compare model size, full/crop image size, and ROI scale before tuning hand/head distances and the behavior trigger/release times. Select settings that maximize `USING_PHONE` recall while keeping false alarms per hour acceptable. Only after measuring this enhanced pretrained baseline should a custom phone-detector fine-tune be considered.

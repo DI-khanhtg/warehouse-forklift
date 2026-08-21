@@ -39,10 +39,18 @@ DISPLAY_HEIGHT = 720
 HAND_PHONE_DISTANCE_THRESHOLD = 0.60
 HEAD_PHONE_DISTANCE_THRESHOLD = 0.70
 
+# Legacy sliding-window settings are retained for API compatibility and the
+# standalone TemporalFilter tests. PhoneUsagePipeline uses the behavior timers below.
 TEMPORAL_WINDOW_SECONDS = 1.5
 ALERT_ON_RATIO = 0.60
 ALERT_OFF_RATIO = 0.30
 MIN_WINDOW_FILL_RATIO = 0.50
+
+CALL_TRIGGER_TIME = 0.6
+HANDHELD_TRIGGER_TIME = 1.0
+WATCHING_TRIGGER_TIME = 1.5
+USAGE_RELEASE_TIME = 0.7
+CALL_RELEASE_TIME = 0.7
 
 USE_DRIVER_ROI = False
 DRIVER_ROI = {"x1": 0.0, "y1": 0.0, "x2": 1.0, "y2": 1.0}
@@ -89,6 +97,11 @@ class Settings:
     alert_on_ratio: float = ALERT_ON_RATIO
     alert_off_ratio: float = ALERT_OFF_RATIO
     min_window_fill_ratio: float = MIN_WINDOW_FILL_RATIO
+    call_trigger_time: float = CALL_TRIGGER_TIME
+    handheld_trigger_time: float = HANDHELD_TRIGGER_TIME
+    watching_trigger_time: float = WATCHING_TRIGGER_TIME
+    usage_release_time: float = USAGE_RELEASE_TIME
+    call_release_time: float = CALL_RELEASE_TIME
     use_driver_roi: bool = USE_DRIVER_ROI
     driver_roi: Tuple[float, float, float, float] = (
         DRIVER_ROI["x1"], DRIVER_ROI["y1"], DRIVER_ROI["x2"], DRIVER_ROI["y2"]
@@ -115,6 +128,11 @@ def add_common_inference_args(parser) -> None:
     parser.add_argument("--window-seconds", type=float, default=None)
     parser.add_argument("--alert-on-ratio", type=float, default=None)
     parser.add_argument("--alert-off-ratio", type=float, default=None)
+    parser.add_argument("--call-trigger-seconds", type=float, default=None)
+    parser.add_argument("--handheld-trigger-seconds", type=float, default=None)
+    parser.add_argument("--watching-trigger-seconds", type=float, default=None)
+    parser.add_argument("--usage-release-seconds", type=float, default=None)
+    parser.add_argument("--call-release-seconds", type=float, default=None)
     parser.add_argument(
         "--phone-image-size", type=int, choices=(640, 960, 1280), default=None,
         help="Full-frame phone detector size",
@@ -218,6 +236,11 @@ def settings_from_args(args) -> Settings:
         "temporal_window_seconds": getattr(args, "window_seconds", None),
         "alert_on_ratio": getattr(args, "alert_on_ratio", None),
         "alert_off_ratio": getattr(args, "alert_off_ratio", None),
+        "call_trigger_time": getattr(args, "call_trigger_seconds", None),
+        "handheld_trigger_time": getattr(args, "handheld_trigger_seconds", None),
+        "watching_trigger_time": getattr(args, "watching_trigger_seconds", None),
+        "usage_release_time": getattr(args, "usage_release_seconds", None),
+        "call_release_time": getattr(args, "call_release_seconds", None),
     }
     settings = Settings().with_overrides(**overrides)
     legacy_image_size = getattr(args, "image_size", None)
@@ -259,6 +282,16 @@ def settings_from_args(args) -> Settings:
         settings = settings.with_overrides(show_debug_lines=False)
     if settings.alert_off_ratio > settings.alert_on_ratio:
         raise ValueError("--alert-off-ratio cannot exceed --alert-on-ratio")
+    behavior_times = {
+        "--call-trigger-seconds": settings.call_trigger_time,
+        "--handheld-trigger-seconds": settings.handheld_trigger_time,
+        "--watching-trigger-seconds": settings.watching_trigger_time,
+        "--usage-release-seconds": settings.usage_release_time,
+        "--call-release-seconds": settings.call_release_time,
+    }
+    for argument, value in behavior_times.items():
+        if value < 0:
+            raise ValueError(f"{argument} cannot be negative")
     if not 0.0 <= settings.phone_debug_internal_conf_threshold <= settings.phone_conf_threshold <= 1.0:
         raise ValueError("Phone confidences must satisfy 0 <= internal <= normal <= 1")
     if settings.phone_roi_scale <= 0:
