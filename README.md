@@ -1,5 +1,20 @@
 # warehouse-forklift
 
+## Sample outputs
+
+### R2 — Forklift slowdown detection
+
+![R2 forklift slowdown detection output](pics/r2.png)
+
+### R6 — Phone usage detection
+
+![R6 phone usage detection output](pics/r6.png)
+
+### R7 — Unsafe double-action detection
+
+![R7 unsafe double-action detection output](pics/r7.png)
+
+## Setup and usage
 
 ```powershell
 uv sync
