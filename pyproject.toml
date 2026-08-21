@@ -23,8 +23,8 @@ dependencies = [
     "pyyaml==6.0.3",
     "scipy>=1.17,<2",
     "supervision==0.30.0",
-    "torch==2.13.0+cu130",
-    "torchvision==0.28.0+cu130",
+    "torch==2.13.0+cu126",
+    "torchvision==0.28.0+cu126",
     "tqdm>=4.70,<5",
     "ultralytics==8.4.116",
 ]
@@ -43,10 +43,10 @@ default-groups = ["dev"]
 pythonpath = ["r6-2"]
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu130" }
-torchvision = { index = "pytorch-cu130" }
+torch = { index = "pytorch-cu126" }
+torchvision = { index = "pytorch-cu126" }
 
 [[tool.uv.index]]
-name = "pytorch-cu130"
-url = "https://download.pytorch.org/whl/cu130"
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
 explicit = true
